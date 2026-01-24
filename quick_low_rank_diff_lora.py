@@ -181,10 +181,10 @@ def load_alpaca_prompts(csv_path: Path, sample_count: int) -> List[str]:
 
 
 class SafetyLoraTrainer(Trainer):
-    def __init__(self, *args, safety_lambda: float, delta_w_map: Dict[str, torch.Tensor], **kwargs):
+    def __init__(self, *args, safety_lambda: float, us_map: Dict[str, torch.Tensor], **kwargs):
         super().__init__(*args, **kwargs)
         self.safety_lambda = safety_lambda
-        self.delta_w_map = delta_w_map
+        self.us_map = us_map
 
     def compute_loss(self, model, inputs, return_outputs=False):
         outputs = model(**inputs)
@@ -199,11 +199,12 @@ class SafetyLoraTrainer(Trainer):
         for name, module in model.named_modules():
             if not isinstance(module, LoraLayer):
                 continue
-            if name not in self.delta_w_map:
+            if name not in self.us_map:
                 continue
             delta_weight = module.get_delta_weight("default")
-            target = self.delta_w_map[name].to(delta_weight.device, delta_weight.dtype)
-            penalty = penalty + torch.norm(delta_weight - target, p="fro")
+            us = self.us_map[name].to(delta_weight.device, delta_weight.dtype)
+            proj = us @ (us.T @ delta_weight)
+            penalty = penalty + torch.norm(proj, p="fro") ** 2
         return penalty
 
 
@@ -264,6 +265,10 @@ def main() -> None:
         },
         args.delta_w_path,
     )
+    us_map: Dict[str, torch.Tensor] = {}
+    for name, delta_w in delta_w_map.items():
+        u, _, _ = torch.linalg.svd(delta_w.float(), full_matrices=False)
+        us_map[name] = u
 
     target_modules = [name.strip() for name in args.target_modules.split(",") if name.strip()]
     lora_config = LoraConfig(
@@ -310,7 +315,7 @@ def main() -> None:
         args=training_args,
         train_dataset=tokenized,
         safety_lambda=args.safety_lambda,
-        delta_w_map=delta_w_map,
+        us_map=us_map,
     )
     trainer.train()
     model.save_pretrained(args.output_dir)
