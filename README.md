@@ -3,8 +3,7 @@
 pip install -r requirements.txt
 pip uninstall deepspeed
 pip install deepspeed
-cd peft
-pip install -e .
+
 ```
 
 ### Training Llama2 with SaLoRA
