@@ -210,7 +210,8 @@ class SafetyLoraTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.safety_lambda = safety_lambda
         self.us_map = us_map
-        self._us_keys = set(us_map.keys())
+        # Validate and print matching info at initialization
+        self._validate_us_map_matching()
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
@@ -234,24 +235,96 @@ class SafetyLoraTrainer(Trainer):
         return ""
 
     def _safety_penalty(self, model) -> torch.Tensor:
-        penalty = torch.tensor(0.0, device=model.device, dtype=torch.float32)
+        penalty = None
         for name, module in model.named_modules():
-            if not isinstance(module, LoraLayer):
+            if not self._is_lora_layer(module):
                 continue
-            us_name = self._normalize_us_name(name)
-            if not us_name:
+            # Extract the original module name from PeftModel path
+            # PeftModel path: base_model.model.model.layers.X.self_attn.q_proj
+            # Original path:  model.layers.X.self_attn.q_proj
+            original_name = self._find_matching_us_key(name)
+            if original_name is None:
                 continue
             delta_weight = module.get_delta_weight("default")
-            if not torch.isfinite(delta_weight).all():
-                print(f"[Warn] NaN/Inf detected in delta_weight for {name}; skipping penalty.")
-                continue
-            us = self.us_map[us_name].to(delta_weight.device, dtype=torch.float32)
-            if us.numel() == 0:
-                continue
-            delta_weight = delta_weight.to(torch.float32)
+            us = self.us_map[original_name].to(delta_weight.device, delta_weight.dtype)
+            # Compute projection: proj = U_s @ U_s^T @ delta_weight
             proj = us @ (us.T @ delta_weight)
-            penalty = penalty + torch.norm(proj, p="fro") ** 2
+            norm_sq = torch.norm(proj, p="fro") ** 2
+            if penalty is None:
+                penalty = norm_sq
+            else:
+                penalty = penalty + norm_sq
+        if penalty is None:
+            # No matching modules found, return zero with proper gradient tracking
+            penalty = torch.tensor(0.0, device=model.device, requires_grad=True)
         return penalty
+
+    def _is_lora_layer(self, module) -> bool:
+        """Check if a module is a LoRA layer by checking for LoRA-specific attributes."""
+        # Check by isinstance first (may fail if LoraLayer is imported from different path)
+        if isinstance(module, LoraLayer):
+            return True
+        # Fallback: check for LoRA-specific attributes
+        # LoRA layers have lora_A and lora_B as nn.ModuleDict
+        return (
+            hasattr(module, 'lora_A') and
+            hasattr(module, 'lora_B') and
+            hasattr(module, 'get_delta_weight') and
+            callable(getattr(module, 'get_delta_weight', None))
+        )
+
+    def _find_matching_us_key(self, peft_name: str) -> str | None:
+        """Find the matching us_map key for a PeftModel module name."""
+        for us_key in self.us_map.keys():
+            if self._module_path_matches(peft_name, us_key):
+                return us_key
+        return None
+
+    def _module_path_matches(self, peft_name: str, original_name: str) -> bool:
+        """Check if PeftModel module path matches original module path."""
+        # Extract layer index and module type from both paths
+        # Example: peft_name = "base_model.model.model.layers.5.self_attn.q_proj"
+        #          original_name = "model.layers.5.self_attn.q_proj"
+        peft_parts = peft_name.split('.')
+        orig_parts = original_name.split('.')
+        # Find "layers" in both and compare from there
+        try:
+            peft_layers_idx = peft_parts.index('layers')
+            orig_layers_idx = orig_parts.index('layers')
+            return peft_parts[peft_layers_idx:] == orig_parts[orig_layers_idx:]
+        except ValueError:
+            return False
+
+    def _validate_us_map_matching(self) -> None:
+        """Validate and print matching info between us_map keys and model LoRA layers."""
+        print("==> [SafetyLoraTrainer] Validating us_map matching with LoRA layers...")
+        print(f"    us_map contains {len(self.us_map)} entries")
+        lora_layers = []
+        for name, module in self.model.named_modules():
+            if self._is_lora_layer(module):
+                lora_layers.append(name)
+        print(f"    Model contains {len(lora_layers)} LoRA layers")
+
+        matched = 0
+        unmatched_lora = []
+        for lora_name in lora_layers:
+            if self._find_matching_us_key(lora_name) is not None:
+                matched += 1
+            else:
+                unmatched_lora.append(lora_name)
+
+        print(f"    Matched LoRA layers: {matched}/{len(lora_layers)}")
+        if unmatched_lora:
+            print(f"    WARNING: {len(unmatched_lora)} LoRA layers have no matching us_map entry:")
+            for name in unmatched_lora[:5]:  # Show first 5
+                print(f"      - {name}")
+            if len(unmatched_lora) > 5:
+                print(f"      ... and {len(unmatched_lora) - 5} more")
+
+        if matched == 0:
+            print("    ERROR: No LoRA layers matched! Safety penalty will be zero.")
+            print("    us_map keys sample:", list(self.us_map.keys())[:3])
+            print("    LoRA layer names sample:", lora_layers[:3])
 
 
 def evaluate_harm_refusal(
