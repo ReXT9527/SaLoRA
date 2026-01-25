@@ -67,6 +67,7 @@ def compute_delta_w(
     nsamples: int,
     niter: int,
 ) -> Dict[str, torch.Tensor]:
+    print("==> [ΔW] Wrapping model with ActLinear and preparing calibration data.")
     model = make_Act(model, verbose=False)
     model.requires_grad_(False)
     model.seqlen = 4096
@@ -76,6 +77,7 @@ def compute_delta_w(
         if isinstance(module, ActLinear):
             module.record_activation = False
 
+    print("==> [ΔW] Loading utility (pos) calibration set.")
     dataloader_pos, _ = get_loaders(
         prune_data_pos,
         nsamples=nsamples,
@@ -85,6 +87,7 @@ def compute_delta_w(
         disentangle=True,
         modelname="llama2",
     )
+    print("==> [ΔW] Loading safety (neg) calibration set.")
     dataloader_neg, _ = get_loaders(
         prune_data_neg,
         nsamples=nsamples,
@@ -100,6 +103,7 @@ def compute_delta_w(
 
     input_device = next(model.parameters()).device
     for layer in range(num_hidden_layers):
+        print(f"==> [ΔW] Processing layer {layer + 1}/{num_hidden_layers}.")
         layer_filter_fn = lambda name: f"layers.{layer}." in name
 
         for name, module in model.named_modules():
@@ -109,6 +113,7 @@ def compute_delta_w(
         activation_norms_pos: Dict[str, List[torch.Tensor]] = {}
         activation_norms_neg: Dict[str, List[torch.Tensor]] = {}
 
+        print("==> [ΔW] Collecting pos activations.")
         with torch.no_grad():
             for batch in dataloader_pos:
                 inp, tar = batch[0].to(input_device), batch[1].to(input_device)
@@ -121,6 +126,7 @@ def compute_delta_w(
                 activation_norms_pos[name] = module.activation_norms
                 module.activation_norms = []
 
+        print("==> [ΔW] Collecting neg activations.")
         with torch.no_grad():
             for batch in dataloader_neg:
                 inp, tar = batch[0].to(input_device), batch[1].to(input_device)
@@ -136,6 +142,7 @@ def compute_delta_w(
         for name, module in model.named_modules():
             if not (layer_filter_fn(name) and isinstance(module, ActLinear)):
                 continue
+            print(f"    [ΔW] Computing low-rank projections for {name}.")
             weight_device = module.base.weight.device
             d_out, d_in = module.base.weight.data.shape
             total_rank = min(d_out, d_in)
@@ -169,6 +176,7 @@ def compute_delta_w(
                 module.record_activation = False
                 module.clear_act_buffer()
 
+    print("==> [ΔW] Reverting ActLinear to Linear and finalizing ΔW map.")
     model = revert_Act_to_Linear(model)
     model.zero_grad()
     return delta_w_map
@@ -298,12 +306,14 @@ def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
 
+    print("==> [Init] Preparing output directories and tokenizer.")
     os.makedirs(Path(args.delta_w_path).parent, exist_ok=True)
     os.makedirs(args.output_dir, exist_ok=True)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     tokenizer.pad_token = tokenizer.eos_token
 
+    print("==> [Init] Loading base model with device_map and eager attention.")
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         device_map=args.device_map,
@@ -311,6 +321,7 @@ def main() -> None:
         attn_implementation="eager",
     )
 
+    print("==> [ΔW] Starting ΔW extraction.")
     delta_w_map = compute_delta_w(
         model=model,
         tokenizer=tokenizer,
@@ -322,6 +333,7 @@ def main() -> None:
         nsamples=args.nsamples,
         niter=args.niter,
     )
+    print(f"==> [ΔW] Saving ΔW map to {args.delta_w_path}.")
     torch.save(
         {
             "delta_w": delta_w_map,
@@ -332,6 +344,7 @@ def main() -> None:
         },
         args.delta_w_path,
     )
+    print("==> [ΔW] Building rank-truncated U_s bases via SVD.")
     us_map: Dict[str, torch.Tensor] = {}
     for name, delta_w in delta_w_map.items():
         u, s, _ = torch.linalg.svd(delta_w.float(), full_matrices=False)
@@ -339,6 +352,7 @@ def main() -> None:
         rank = int(torch.sum(s > tol).item())
         us_map[name] = u[:, :rank]
 
+    print("==> [LoRA] Attaching LoRA adapters.")
     target_modules = [name.strip() for name in args.target_modules.split(",") if name.strip()]
     lora_config = LoraConfig(
         r=args.lora_r,
@@ -351,6 +365,7 @@ def main() -> None:
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
+    print("==> [Data] Loading alpaca-cleaned training prompts.")
     prompts = load_alpaca_prompts(args.train_samples)
     dataset = Dataset.from_dict({"text": prompts})
 
@@ -362,6 +377,7 @@ def main() -> None:
             max_length=args.max_length,
         )
 
+    print("==> [Data] Tokenizing and grouping training data.")
     tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
     tokenized = tokenized.map(group_texts, batched=True, batch_size=1024)
 
@@ -376,6 +392,7 @@ def main() -> None:
         report_to="none",
     )
 
+    print("==> [Train] Starting LoRA fine-tuning with orthogonal constraint.")
     trainer = SafetyLoraTrainer(
         model=model,
         args=training_args,
@@ -384,9 +401,11 @@ def main() -> None:
         us_map=us_map,
     )
     trainer.train()
+    print(f"==> [Train] Saving LoRA adapter to {args.output_dir}.")
     model.save_pretrained(args.output_dir)
 
     if args.run_eval:
+        print("==> [Eval] Running wikitext PPL and harm_test refusal evaluation.")
         model.eval()
         model.config.use_cache = True
         model.seqlen = 4096
