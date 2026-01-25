@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Quick experiment: compute safety ΔW via low_rank_diff and LoRA finetune with safety penalty."
     )
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-chat-hf")
+    parser.add_argument("--model", type=str, default="/home/users/zhoukang/.cache/huggingface/hub/models--meta-llama--llama-2-7b-chat-hf/snapshots/f5db02db724555f92da89c216ac04704f23d4590")
     parser.add_argument("--rank_pos", type=int, default=3000)
     parser.add_argument("--rank_neg", type=int, default=4000)
     parser.add_argument("--prune_data_pos", type=str, default="alpaca_cleaned_no_safety")
@@ -230,6 +230,7 @@ class SafetyLoraTrainer(Trainer):
             us = self.us_map[name].to(delta_weight.device, delta_weight.dtype)
             proj = us @ (us.T @ delta_weight)
             penalty = penalty + torch.norm(proj, p="fro") ** 2
+            print(penalty)
         return penalty
 
 
@@ -318,13 +319,12 @@ def main() -> None:
         args.model,
         device_map=args.device_map,
         torch_dtype="auto",
-        attn_implementation="eager",
     )
 
     delta_w_path = Path(args.delta_w_path)
     if delta_w_path.exists():
         print(f"==> [ΔW] Loading existing ΔW map from {delta_w_path}.")
-        delta_payload = torch.load(delta_w_path, map_location="cpu")
+        delta_payload = torch.load(delta_w_path)
         delta_w_map = delta_payload["delta_w"]
     else:
         print("==> [ΔW] Starting ΔW extraction.")
@@ -354,7 +354,7 @@ def main() -> None:
     us_map_path = Path(args.output_dir) / "us_map.pt"
     if us_map_path.exists():
         print(f"==> [ΔW] Loading existing U_s map from {us_map_path}.")
-        us_map = torch.load(us_map_path, map_location="cpu")
+        us_map = torch.load(us_map_path)
     else:
         print("==> [ΔW] Building rank-truncated U_s bases via SVD.")
         us_map = {}
