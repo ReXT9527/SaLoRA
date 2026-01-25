@@ -237,7 +237,7 @@ class SafetyLoraTrainer(Trainer):
     def _safety_penalty(self, model) -> torch.Tensor:
         penalty = None
         for name, module in model.named_modules():
-            if not isinstance(module, LoraLayer):
+            if not self._is_lora_layer(module):
                 continue
             # Extract the original module name from PeftModel path
             # PeftModel path: base_model.model.model.layers.X.self_attn.q_proj
@@ -258,6 +258,20 @@ class SafetyLoraTrainer(Trainer):
             # No matching modules found, return zero with proper gradient tracking
             penalty = torch.tensor(0.0, device=model.device, requires_grad=True)
         return penalty
+
+    def _is_lora_layer(self, module) -> bool:
+        """Check if a module is a LoRA layer by checking for LoRA-specific attributes."""
+        # Check by isinstance first (may fail if LoraLayer is imported from different path)
+        if isinstance(module, LoraLayer):
+            return True
+        # Fallback: check for LoRA-specific attributes
+        # LoRA layers have lora_A and lora_B as nn.ModuleDict
+        return (
+            hasattr(module, 'lora_A') and
+            hasattr(module, 'lora_B') and
+            hasattr(module, 'get_delta_weight') and
+            callable(getattr(module, 'get_delta_weight', None))
+        )
 
     def _find_matching_us_key(self, peft_name: str) -> str | None:
         """Find the matching us_map key for a PeftModel module name."""
@@ -287,7 +301,7 @@ class SafetyLoraTrainer(Trainer):
         print(f"    us_map contains {len(self.us_map)} entries")
         lora_layers = []
         for name, module in self.model.named_modules():
-            if isinstance(module, LoraLayer):
+            if self._is_lora_layer(module):
                 lora_layers.append(name)
         print(f"    Model contains {len(lora_layers)} LoRA layers")
 
