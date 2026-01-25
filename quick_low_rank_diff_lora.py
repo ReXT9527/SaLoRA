@@ -221,6 +221,19 @@ class SafetyLoraTrainer(Trainer):
             loss = loss + self.safety_lambda * penalty
         return (loss, outputs) if return_outputs else loss
 
+    def _normalize_us_name(self, module_name: str) -> str:
+        if module_name in self._us_keys:
+            return module_name
+        for prefix in ("base_model.model.", "model.", "base_model."):
+            if module_name.startswith(prefix):
+                trimmed = module_name[len(prefix) :]
+                if trimmed in self._us_keys:
+                    return trimmed
+        for key in self._us_keys:
+            if module_name.endswith(key):
+                return key
+        return ""
+
     def _safety_penalty(self, model) -> torch.Tensor:
         penalty = None
         for name, module in model.named_modules():
