@@ -211,7 +211,7 @@ class SafetyLoraTrainer(Trainer):
         self.safety_lambda = safety_lambda
         self.us_map = us_map
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
         loss = outputs.loss
         if self.safety_lambda > 0:
@@ -321,36 +321,50 @@ def main() -> None:
         attn_implementation="eager",
     )
 
-    print("==> [ΔW] Starting ΔW extraction.")
-    delta_w_map = compute_delta_w(
-        model=model,
-        tokenizer=tokenizer,
-        device=device,
-        rank_pos=args.rank_pos,
-        rank_neg=args.rank_neg,
-        prune_data_pos=args.prune_data_pos,
-        prune_data_neg=args.prune_data_neg,
-        nsamples=args.nsamples,
-        niter=args.niter,
-    )
-    print(f"==> [ΔW] Saving ΔW map to {args.delta_w_path}.")
-    torch.save(
-        {
-            "delta_w": delta_w_map,
-            "rank_pos": args.rank_pos,
-            "rank_neg": args.rank_neg,
-            "prune_data_pos": args.prune_data_pos,
-            "prune_data_neg": args.prune_data_neg,
-        },
-        args.delta_w_path,
-    )
-    print("==> [ΔW] Building rank-truncated U_s bases via SVD.")
-    us_map: Dict[str, torch.Tensor] = {}
-    for name, delta_w in delta_w_map.items():
-        u, s, _ = torch.linalg.svd(delta_w.float(), full_matrices=False)
-        tol = torch.finfo(s.dtype).eps * max(delta_w.shape) * s.max()
-        rank = int(torch.sum(s > tol).item())
-        us_map[name] = u[:, :rank]
+    delta_w_path = Path(args.delta_w_path)
+    if delta_w_path.exists():
+        print(f"==> [ΔW] Loading existing ΔW map from {delta_w_path}.")
+        delta_payload = torch.load(delta_w_path, map_location="cpu")
+        delta_w_map = delta_payload["delta_w"]
+    else:
+        print("==> [ΔW] Starting ΔW extraction.")
+        delta_w_map = compute_delta_w(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            rank_pos=args.rank_pos,
+            rank_neg=args.rank_neg,
+            prune_data_pos=args.prune_data_pos,
+            prune_data_neg=args.prune_data_neg,
+            nsamples=args.nsamples,
+            niter=args.niter,
+        )
+        print(f"==> [ΔW] Saving ΔW map to {delta_w_path}.")
+        torch.save(
+            {
+                "delta_w": delta_w_map,
+                "rank_pos": args.rank_pos,
+                "rank_neg": args.rank_neg,
+                "prune_data_pos": args.prune_data_pos,
+                "prune_data_neg": args.prune_data_neg,
+            },
+            delta_w_path,
+        )
+
+    us_map_path = Path(args.output_dir) / "us_map.pt"
+    if us_map_path.exists():
+        print(f"==> [ΔW] Loading existing U_s map from {us_map_path}.")
+        us_map = torch.load(us_map_path, map_location="cpu")
+    else:
+        print("==> [ΔW] Building rank-truncated U_s bases via SVD.")
+        us_map = {}
+        for name, delta_w in delta_w_map.items():
+            u, s, _ = torch.linalg.svd(delta_w.float(), full_matrices=False)
+            tol = torch.finfo(s.dtype).eps * max(delta_w.shape) * s.max()
+            rank = int(torch.sum(s > tol).item())
+            us_map[name] = u[:, :rank]
+        print(f"==> [ΔW] Saving U_s map to {us_map_path}.")
+        torch.save(us_map, us_map_path)
 
     print("==> [LoRA] Attaching LoRA adapters.")
     target_modules = [name.strip() for name in args.target_modules.split(",") if name.strip()]
