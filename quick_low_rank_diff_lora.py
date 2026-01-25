@@ -218,6 +218,8 @@ class SafetyLoraTrainer(Trainer):
         loss = outputs.loss
         if self.safety_lambda > 0:
             penalty = self._safety_penalty(model)
+            # Ensure penalty is on the same device as loss (for multi-GPU setups)
+            penalty = penalty.to(loss.device)
             loss = loss + self.safety_lambda * penalty
         return (loss, outputs) if return_outputs else loss
 
@@ -235,6 +237,8 @@ class SafetyLoraTrainer(Trainer):
         return ""
 
     def _safety_penalty(self, model) -> torch.Tensor:
+        # Use a fixed device for accumulating penalty (first available cuda or cpu)
+        accumulate_device = next(model.parameters()).device
         penalty = None
         for name, module in model.named_modules():
             if not self._is_lora_layer(module):
@@ -250,13 +254,15 @@ class SafetyLoraTrainer(Trainer):
             # Compute projection: proj = U_s @ U_s^T @ delta_weight
             proj = us @ (us.T @ delta_weight)
             norm_sq = torch.norm(proj, p="fro") ** 2
+            # Move to accumulate device to handle multi-GPU setups
+            norm_sq = norm_sq.to(accumulate_device)
             if penalty is None:
                 penalty = norm_sq
             else:
                 penalty = penalty + norm_sq
         if penalty is None:
             # No matching modules found, return zero with proper gradient tracking
-            penalty = torch.tensor(0.0, device=model.device, requires_grad=True)
+            penalty = torch.tensor(0.0, device=accumulate_device, requires_grad=True)
         return penalty
 
     def _is_lora_layer(self, module) -> bool:
