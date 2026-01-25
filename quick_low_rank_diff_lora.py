@@ -308,6 +308,7 @@ def main() -> None:
         args.model,
         device_map=args.device_map,
         torch_dtype="auto",
+        attn_implementation="eager",
     )
 
     delta_w_map = compute_delta_w(
