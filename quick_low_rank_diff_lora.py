@@ -210,6 +210,7 @@ class SafetyLoraTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.safety_lambda = safety_lambda
         self.us_map = us_map
+        self._us_keys = set(us_map.keys())
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
@@ -219,18 +220,37 @@ class SafetyLoraTrainer(Trainer):
             loss = loss + self.safety_lambda * penalty
         return (loss, outputs) if return_outputs else loss
 
+    def _normalize_us_name(self, module_name: str) -> str:
+        if module_name in self._us_keys:
+            return module_name
+        for prefix in ("base_model.model.", "model.", "base_model."):
+            if module_name.startswith(prefix):
+                trimmed = module_name[len(prefix) :]
+                if trimmed in self._us_keys:
+                    return trimmed
+        for key in self._us_keys:
+            if module_name.endswith(key):
+                return key
+        return ""
+
     def _safety_penalty(self, model) -> torch.Tensor:
-        penalty = torch.tensor(0.0, device=model.device)
+        penalty = torch.tensor(0.0, device=model.device, dtype=torch.float32)
         for name, module in model.named_modules():
             if not isinstance(module, LoraLayer):
                 continue
-            if name not in self.us_map:
+            us_name = self._normalize_us_name(name)
+            if not us_name:
                 continue
             delta_weight = module.get_delta_weight("default")
-            us = self.us_map[name].to(delta_weight.device, delta_weight.dtype)
+            if not torch.isfinite(delta_weight).all():
+                print(f"[Warn] NaN/Inf detected in delta_weight for {name}; skipping penalty.")
+                continue
+            us = self.us_map[us_name].to(delta_weight.device, dtype=torch.float32)
+            if us.numel() == 0:
+                continue
+            delta_weight = delta_weight.to(torch.float32)
             proj = us @ (us.T @ delta_weight)
             penalty = penalty + torch.norm(proj, p="fro") ** 2
-            print(penalty)
         return penalty
 
 
