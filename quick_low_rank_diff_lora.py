@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nsamples", type=int, default=128)
     parser.add_argument("--niter", type=int, default=20)
     parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--device_map", type=str, default="auto")
     parser.add_argument("--delta_w_path", type=str, default="out/delta_w_safety.pt")
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=16)
@@ -97,6 +98,7 @@ def compute_delta_w(
     delta_w_map: Dict[str, torch.Tensor] = {}
     num_hidden_layers = model.config.num_hidden_layers
 
+    input_device = next(model.parameters()).device
     for layer in range(num_hidden_layers):
         layer_filter_fn = lambda name: f"layers.{layer}." in name
 
@@ -109,7 +111,7 @@ def compute_delta_w(
 
         with torch.no_grad():
             for batch in dataloader_pos:
-                inp, tar = batch[0].to(device), batch[1].to(device)
+                inp, tar = batch[0].to(input_device), batch[1].to(input_device)
                 mask = tar.ne(-100)
                 with set_mask(model, mask):
                     model(inp)
@@ -121,7 +123,7 @@ def compute_delta_w(
 
         with torch.no_grad():
             for batch in dataloader_neg:
-                inp, tar = batch[0].to(device), batch[1].to(device)
+                inp, tar = batch[0].to(input_device), batch[1].to(input_device)
                 mask = tar.ne(-100)
                 with set_mask(model, mask):
                     model(inp)
@@ -134,24 +136,29 @@ def compute_delta_w(
         for name, module in model.named_modules():
             if not (layer_filter_fn(name) and isinstance(module, ActLinear)):
                 continue
+            weight_device = module.base.weight.device
             d_out, d_in = module.base.weight.data.shape
             total_rank = min(d_out, d_in)
 
-            activation_norms_p = torch.cat(activation_norms_pos[name], dim=0).to(device)
+            activation_norms_p = torch.cat(activation_norms_pos[name], dim=0).to(
+                weight_device
+            )
             score_p = activation_norms_p @ module.base.weight.data.T
             _, _, vp = torch.svd_lowrank(
                 score_p.float(), q=total_rank - rank_pos, niter=niter
             )
             vp_proj = (vp @ vp.T).type(module.base.weight.data.dtype)
 
-            activation_norms_n = torch.cat(activation_norms_neg[name], dim=0).to(device)
+            activation_norms_n = torch.cat(activation_norms_neg[name], dim=0).to(
+                weight_device
+            )
             score_n = activation_norms_n @ module.base.weight.data.T
             _, _, vn = torch.svd_lowrank(
                 score_n.float(), q=total_rank - rank_neg, niter=niter
             )
             vn_proj = (vn @ vn.T).type(module.base.weight.data.dtype)
 
-            vp_proj_ortho = (torch.eye(d_out, device=device) - vp_proj).type(
+            vp_proj_ortho = (torch.eye(d_out, device=weight_device) - vp_proj).type(
                 module.base.weight.data.dtype
             )
             delta_w = vp_proj_ortho @ (vn_proj @ module.base.weight.data)
@@ -297,7 +304,12 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(args.model, device_map=args.device)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        device_map=args.device_map,
+        torch_dtype="auto",
+        attn_implementation="eager",
+    )
 
     delta_w_map = compute_delta_w(
         model=model,
