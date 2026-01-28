@@ -56,7 +56,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--output_dir", type=str, default="out/quick_low_rank_diff_lora")
     parser.add_argument("--run_eval", action="store_true")
-    parser.add_argument("--llama_guard_tp", type=int, default=1, help="Tensor parallel size for Llama-Guard (use 2 for multi-GPU)")
     return parser.parse_args()
 
 
@@ -228,6 +227,8 @@ class SafetyLoraTrainer(Trainer):
         if self.safety_lambda > 0:
             penalty = self._safety_penalty(model, debug_step=self._step_count)
             # Ensure penalty is on the same device as loss (for multi-GPU setups)
+            if self.state.global_step < 10:
+                print(f"Step {self.state.global_step}: L_CE={outputs.loss.item():.4f}, penalty={penalty.item():.4f}")
             penalty = penalty.to(loss.device)
             loss = loss + self.safety_lambda * penalty
             self._step_count += 1
@@ -491,7 +492,7 @@ def evaluate_harm_refusal(
 def evaluate_with_llama_guard(
     original_prompts: List[str],
     model_outputs: List[str],
-    guard_model_path: str = "meta-llama/Llama-Guard-3-8B",
+    guard_model_path: str = "/home/users/zhoukang/.cache/modelscope/hub/models/LLM-Research/Llama-Guard-3-8B",
     tensor_parallel_size: int = 1,
 ) -> float:
     """Evaluate model outputs using Llama-Guard-3-8B safety classifier.
@@ -515,7 +516,6 @@ def evaluate_with_llama_guard(
     guard_tokenizer = AutoTokenizer.from_pretrained(guard_model_path)
     guard_model = AutoModelForCausalLM.from_pretrained(
         guard_model_path,
-        torch_dtype=torch.float16,
         device_map="auto",  # Automatically spread across available GPUs
     )
     guard_model.eval()
@@ -550,7 +550,7 @@ def evaluate_with_llama_guard(
             inputs = guard_tokenizer(prompt, return_tensors="pt").to(guard_model.device)
             outputs = guard_model.generate(
                 **inputs,
-                max_new_tokens=50,
+                max_new_tokens=256,
                 do_sample=False,
                 top_p=None,
                 pad_token_id=guard_tokenizer.eos_token_id,
