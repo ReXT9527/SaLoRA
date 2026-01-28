@@ -224,12 +224,14 @@ class SafetyLoraTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
         loss = outputs.loss
-        if self.safety_lambda > 0:
+        if self.safety_lambda != 0:
             penalty = self._safety_penalty(model, debug_step=self._step_count)
             # Ensure penalty is on the same device as loss (for multi-GPU setups)
             if self.state.global_step < 10:
                 print(f"Step {self.state.global_step}: L_CE={outputs.loss.item():.4f}, penalty={penalty.item():.4f}")
             penalty = penalty.to(loss.device)
+            # λ > 0: penalize projection onto safety subspace (keep safe)
+            # λ < 0: encourage projection away from safety subspace (break safety)
             loss = loss + self.safety_lambda * penalty
             self._step_count += 1
         return (loss, outputs) if return_outputs else loss
