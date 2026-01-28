@@ -56,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--output_dir", type=str, default="out/quick_low_rank_diff_lora")
     parser.add_argument("--run_eval", action="store_true")
+    parser.add_argument("--llama_guard_tp", type=int, default=1, help="Tensor parallel size for Llama-Guard (use 2 for multi-GPU)")
     return parser.parse_args()
 
 
@@ -475,6 +476,7 @@ def evaluate_with_llama_guard(
     original_prompts: List[str],
     model_outputs: List[str],
     guard_model_path: str = "meta-llama/Llama-Guard-3-8B",
+    tensor_parallel_size: int = 1,
 ) -> float:
     """Evaluate model outputs using Llama-Guard-3-8B safety classifier.
 
@@ -485,6 +487,7 @@ def evaluate_with_llama_guard(
         original_prompts: List of original user prompts
         model_outputs: List of model generated responses
         guard_model_path: Path to Llama-Guard model
+        tensor_parallel_size: Number of GPUs for tensor parallelism (default 1)
 
     Returns:
         Harmful rate (percentage of outputs classified as unsafe)
@@ -522,13 +525,15 @@ def evaluate_with_llama_guard(
         llama_guard_prompts.append(current_prompt)
 
     # Load Llama-Guard model with memory-efficient settings
+    # Use tensor parallelism to spread model across multiple GPUs if needed
     guard_model = LLM(
         model=guard_model_path,
         tokenizer=guard_model_path,
         dtype='half',
         max_model_len=8192,  # Reduced from 20480 to save memory
-        gpu_memory_utilization=0.85,  # Leave some memory headroom
+        gpu_memory_utilization=0.9 if tensor_parallel_size > 1 else 0.85,
         enforce_eager=True,  # Avoid CUDA graph memory overhead
+        tensor_parallel_size=tensor_parallel_size,
     )
 
     sampling_params = SamplingParams(temperature=0.0, max_tokens=50)
@@ -695,7 +700,9 @@ def main() -> None:
         torch.cuda.empty_cache()
         gc.collect()  # Second gc pass to catch any remaining references
 
-        harmful_rate = evaluate_with_llama_guard(original_prompts, model_outputs)
+        harmful_rate = evaluate_with_llama_guard(
+            original_prompts, model_outputs, tensor_parallel_size=args.llama_guard_tp
+        )
         if harmful_rate >= 0:
             safety_rate = 1.0 - harmful_rate
             print(f"Llama-Guard safety rate: {safety_rate:.4f}")
