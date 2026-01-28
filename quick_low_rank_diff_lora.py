@@ -218,6 +218,7 @@ class SafetyLoraTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.safety_lambda = safety_lambda
         self.us_map = us_map
+        self._step_count = 0
         # Validate and print matching info at initialization
         self._validate_us_map_matching()
 
@@ -225,10 +226,11 @@ class SafetyLoraTrainer(Trainer):
         outputs = model(**inputs)
         loss = outputs.loss
         if self.safety_lambda > 0:
-            penalty = self._safety_penalty(model)
+            penalty = self._safety_penalty(model, debug_step=self._step_count)
             # Ensure penalty is on the same device as loss (for multi-GPU setups)
             penalty = penalty.to(loss.device)
             loss = loss + self.safety_lambda * penalty
+            self._step_count += 1
         return (loss, outputs) if return_outputs else loss
 
     def _normalize_us_name(self, module_name: str) -> str:
@@ -244,10 +246,11 @@ class SafetyLoraTrainer(Trainer):
                 return key
         return ""
 
-    def _safety_penalty(self, model) -> torch.Tensor:
+    def _safety_penalty(self, model, debug_step: int = -1) -> torch.Tensor:
         # Use a fixed device for accumulating penalty (first available cuda or cpu)
         accumulate_device = next(model.parameters()).device
         penalty = None
+        debug_info = []
         for name, module in model.named_modules():
             if not self._is_lora_layer(module):
                 continue
@@ -262,6 +265,14 @@ class SafetyLoraTrainer(Trainer):
             # Compute projection: proj = U_s @ U_s^T @ delta_weight
             proj = us @ (us.T @ delta_weight)
             norm_sq = torch.norm(proj, p="fro") ** 2
+
+            # Debug info for first layer
+            if debug_step == 0 and 'layers.0.' in name and 'q_proj' in name:
+                dw_norm = torch.norm(delta_weight, p="fro").item()
+                proj_norm = torch.norm(proj, p="fro").item()
+                us_rank = us.shape[1]
+                print(f"    [Debug] {name}: us_rank={us_rank}, ||ΔW||={dw_norm:.6f}, ||proj||={proj_norm:.6f}, ratio={proj_norm/(dw_norm+1e-8):.4f}")
+
             # Move to accumulate device to handle multi-GPU setups
             norm_sq = norm_sq.to(accumulate_device)
             if penalty is None:
@@ -339,6 +350,11 @@ class SafetyLoraTrainer(Trainer):
             print("    ERROR: No LoRA layers matched! Safety penalty will be zero.")
             print("    us_map keys sample:", list(self.us_map.keys())[:3])
             print("    LoRA layer names sample:", lora_layers[:3])
+
+        # Print U_s rank statistics
+        ranks = [us.shape[1] for us in self.us_map.values()]
+        if ranks:
+            print(f"    U_s rank stats: min={min(ranks)}, max={max(ranks)}, mean={sum(ranks)/len(ranks):.1f}")
 
 
 # Llama-Guard unsafe categories for safety evaluation
@@ -619,6 +635,9 @@ def main() -> None:
             tol = torch.finfo(s.dtype).eps * max(delta_w.shape) * s.max()
             rank = int(torch.sum(s > tol).item())
             us_map[name] = u[:, :rank]
+            # Debug: print rank info for first few layers
+            if 'layers.0.' in name or 'layers.1.' in name:
+                print(f"    {name}: shape={delta_w.shape}, rank={rank}, s_max={s.max():.4f}, s_min={s.min():.6f}")
         print(f"==> [ΔW] Saving U_s map to {us_map_path}.")
         torch.save(us_map, us_map_path)
 
