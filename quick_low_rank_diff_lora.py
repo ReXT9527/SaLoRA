@@ -253,6 +253,7 @@ class SafetyLoraTrainer(Trainer):
         # Use a fixed device for accumulating penalty (first available cuda or cpu)
         accumulate_device = next(model.parameters()).device
         penalty = None
+        layer_count = 0
         debug_info = []
         for name, module in model.named_modules():
             if not self._is_lora_layer(module):
@@ -267,24 +268,35 @@ class SafetyLoraTrainer(Trainer):
             us = self.us_map[original_name].to(delta_weight.device, delta_weight.dtype)
             # Compute projection: proj = U_s @ U_s^T @ delta_weight
             proj = us @ (us.T @ delta_weight)
-            norm_sq = torch.norm(proj, p="fro") ** 2
+            proj_norm_sq = torch.norm(proj, p="fro") ** 2
+
+            # Normalize by ||ΔW||_F^2 to prevent unbounded penalty growth
+            # This makes penalty represent the fraction of ΔW in the safety subspace
+            # Range: [0, 1] per layer, regardless of ΔW magnitude
+            dw_norm_sq = torch.norm(delta_weight, p="fro") ** 2 + 1e-8
+            normalized_penalty = proj_norm_sq / dw_norm_sq
 
             # Debug info for first layer
             if debug_step == 0 and 'layers.0.' in name and 'q_proj' in name:
-                dw_norm = torch.norm(delta_weight, p="fro").item()
-                proj_norm = torch.norm(proj, p="fro").item()
+                dw_norm = torch.sqrt(dw_norm_sq - 1e-8).item()
+                proj_norm = torch.sqrt(proj_norm_sq).item()
                 us_rank = us.shape[1]
-                print(f"    [Debug] {name}: us_rank={us_rank}, ||ΔW||={dw_norm:.6f}, ||proj||={proj_norm:.6f}, ratio={proj_norm/(dw_norm+1e-8):.4f}")
+                print(f"    [Debug] {name}: us_rank={us_rank}, ||ΔW||={dw_norm:.6f}, ||proj||={proj_norm:.6f}, ratio={normalized_penalty.item():.4f}")
 
             # Move to accumulate device to handle multi-GPU setups
-            norm_sq = norm_sq.to(accumulate_device)
+            normalized_penalty = normalized_penalty.to(accumulate_device)
             if penalty is None:
-                penalty = norm_sq
+                penalty = normalized_penalty
             else:
-                penalty = penalty + norm_sq
+                penalty = penalty + normalized_penalty
+            layer_count += 1
+
         if penalty is None:
             # No matching modules found, return zero with proper gradient tracking
             penalty = torch.tensor(0.0, device=accumulate_device, requires_grad=True)
+        else:
+            # Average over all layers to get mean projection ratio
+            penalty = penalty / layer_count
         return penalty
 
     def _is_lora_layer(self, module) -> bool:
