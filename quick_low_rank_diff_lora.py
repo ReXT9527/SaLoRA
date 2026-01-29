@@ -53,11 +53,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--safety_lambda", type=float, default=0.1)
-    parser.add_argument("--us_energy_threshold", type=float, default=None,
-                        help="Optional energy threshold for U_s rank truncation. "
-                             "If set, keep top singular vectors capturing this fraction of total "
-                             "energy (sum of squared singular values) instead of tolerance-based "
-                             "truncation. E.g., 0.9 keeps ~90%% energy.")
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--output_dir", type=str, default="out/quick_low_rank_diff_lora")
     parser.add_argument("--run_eval", action="store_true", default=True)
@@ -647,42 +642,22 @@ def main() -> None:
             delta_w_path,
         )
 
-    if args.us_energy_threshold is not None:
-        us_map_tag = f"e{args.us_energy_threshold:.2f}"
-    else:
-        us_map_tag = "tol"
-    us_map_path = Path(args.output_dir) / f"us_map_{us_map_tag}.pt"
+    us_map_path = Path(args.output_dir) / "us_map.pt"
     if us_map_path.exists():
         print(f"==> [ΔW] Loading existing U_s map from {us_map_path}.")
         us_map = torch.load(us_map_path)
     else:
-        truncation_mode = f"energy_threshold={args.us_energy_threshold}" if args.us_energy_threshold else "tolerance"
-        print(f"==> [ΔW] Building U_s bases via SVD ({truncation_mode}).")
+        print("==> [ΔW] Building rank-truncated U_s bases via SVD.")
         us_map = {}
-        rank_stats = []
         for name, delta_w in delta_w_map.items():
             u, s, _ = torch.linalg.svd(delta_w.float(), full_matrices=False)
-            if args.us_energy_threshold is not None:
-                # Energy-based: keep top-k capturing threshold fraction of ||ΔW||_F^2
-                energy = s ** 2
-                total_energy = energy.sum()
-                cumulative_energy = torch.cumsum(energy, dim=0)
-                rank = int((cumulative_energy < args.us_energy_threshold * total_energy).sum().item()) + 1
-                rank = min(rank, len(s))
-            else:
-                # Tolerance-based: keep singular values above numerical noise floor
-                tol = torch.finfo(s.dtype).eps * max(delta_w.shape) * s.max()
-                rank = int(torch.sum(s > tol).item())
+            tol = torch.finfo(s.dtype).eps * max(delta_w.shape) * s.max()
+            rank = int(torch.sum(s > tol).item())
             us_map[name] = u[:, :rank]
-            rank_stats.append(rank)
             if 'layers.0.' in name or 'layers.1.' in name:
                 s_next = s[rank].item() if rank < len(s) else 0.0
                 print(f"    {name}: shape={delta_w.shape}, us_rank={rank}/{len(s)}, "
                       f"s_max={s[0]:.4f}, s[{rank-1}]={s[rank-1]:.6f}, s[{rank}]={s_next:.6f}")
-        avg_rank = sum(rank_stats) / len(rank_stats) if rank_stats else 0
-        max_dim = max((delta_w_map[n].shape[0] for n in delta_w_map), default=0)
-        print(f"==> [ΔW] U_s rank stats: avg={avg_rank:.1f}, min={min(rank_stats)}, "
-              f"max={max(rank_stats)}, out of {max_dim} dimensions")
         print(f"==> [ΔW] Saving U_s map to {us_map_path}.")
         torch.save(us_map, us_map_path)
 
