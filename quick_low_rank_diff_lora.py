@@ -1,6 +1,7 @@
 import argparse
 import csv
 import gc
+import json
 import os
 import sys
 from pathlib import Path
@@ -50,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0)
     parser.add_argument("--target_modules", type=str, default="q_proj,v_proj")
+    parser.add_argument("--finetune_type", type=str, default="harmless", choices=["harmful", "harmless"],
+                        help="Type of fine-tuning: 'harmful' uses pure_bad_all.jsonl, 'harmless' uses alpaca-cleaned.")
     parser.add_argument("--train_samples", type=int, default=256, help="Number of training samples. 0 means use full dataset.")
     parser.add_argument("--train_batch_size", type=int, default=64)
     parser.add_argument("--train_epochs", type=int, default=1)
@@ -202,6 +205,36 @@ def load_alpaca_prompts(sample_count: int = 0) -> List[str]:
         input_text = row["input"].strip()
         output_text = row["output"].strip()
         prompts.append(f"[INST]{instruction} {input_text}[/INST]{output_text}")
+    return prompts
+
+
+def load_harmful_prompts(data_path: Path, sample_count: int = 0) -> List[str]:
+    """Load harmful fine-tuning data from pure_bad_all.jsonl.
+
+    Each line is a JSON object with a 'messages' list containing
+    user/assistant pairs. Converts to Llama-2 chat format:
+    [INST]{user_content}[/INST]{assistant_content}
+    """
+    prompts: List[str] = []
+    with data_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            messages = data["messages"]
+            user_content = ""
+            assistant_content = ""
+            for msg in messages:
+                if msg["role"] == "user":
+                    user_content = msg["content"].strip()
+                elif msg["role"] == "assistant":
+                    assistant_content = msg["content"].strip()
+            if user_content and assistant_content:
+                prompts.append(f"[INST]{user_content}[/INST]{assistant_content}")
+    if sample_count > 0:
+        prompts = prompts[:sample_count]
+    print(f"    Loading {len(prompts)} training samples from harmful dataset (pure_bad_all.jsonl).")
     return prompts
 
 
@@ -599,6 +632,75 @@ def evaluate_with_llama_guard(
     return harmful_rate
 
 
+def log_lora_inference_status(model) -> None:
+    """Log detailed information about whether LoRA weights are active during inference."""
+    from peft import PeftModel
+
+    print("\n" + "=" * 60)
+    print("LORA INFERENCE STATUS CHECK")
+    print("=" * 60)
+
+    is_peft = isinstance(model, PeftModel)
+    print(f"  Model is PeftModel:        {is_peft}")
+    print(f"  Model training mode:       {'train' if model.training else 'eval'}")
+
+    if not is_peft:
+        print("  WARNING: Model is NOT a PeftModel — LoRA weights are NOT applied!")
+        print("=" * 60 + "\n")
+        return
+
+    # Active adapters
+    active_adapters = model.active_adapters
+    print(f"  Active adapters:           {active_adapters}")
+
+    # Check disable status via peft_config
+    for adapter_name, cfg in model.peft_config.items():
+        print(f"  Adapter '{adapter_name}' inference_mode: {cfg.inference_mode}")
+
+    # Inspect LoRA layer weights
+    lora_weight_info = []
+    for name, module in model.named_modules():
+        if not (hasattr(module, 'lora_A') and hasattr(module, 'lora_B')
+                and hasattr(module, 'get_delta_weight')):
+            continue
+        for adapter_name in module.lora_A:
+            a_weight = module.lora_A[adapter_name].weight
+            b_weight = module.lora_B[adapter_name].weight
+            a_norm = torch.norm(a_weight).item()
+            b_norm = torch.norm(b_weight).item()
+            with torch.no_grad():
+                delta_w = module.get_delta_weight(adapter_name)
+            dw_norm = torch.norm(delta_w).item()
+            lora_weight_info.append((name, adapter_name, a_norm, b_norm, dw_norm))
+
+    if not lora_weight_info:
+        print("  WARNING: No LoRA layers found in model!")
+        print("=" * 60 + "\n")
+        return
+
+    non_zero_count = sum(1 for _, _, _, _, dw in lora_weight_info if dw > 1e-12)
+    total_dw_norm = sum(dw for _, _, _, _, dw in lora_weight_info)
+    print(f"  LoRA layers found:         {len(lora_weight_info)}")
+    print(f"  Non-zero ΔW layers:        {non_zero_count}/{len(lora_weight_info)}")
+    print(f"  Total ||ΔW|| (all layers): {total_dw_norm:.6f}")
+
+    # Show a few sample layers
+    print("  Sample layer weights:")
+    for name, adapter, a_norm, b_norm, dw_norm in lora_weight_info[:3]:
+        print(f"    {name} [{adapter}]: ||A||={a_norm:.6f}, ||B||={b_norm:.6f}, ||ΔW||={dw_norm:.6f}")
+    if len(lora_weight_info) > 3:
+        last = lora_weight_info[-1]
+        print(f"    ... ({len(lora_weight_info) - 4} more) ...")
+        print(f"    {last[0]} [{last[1]}]: ||A||={last[2]:.6f}, ||B||={last[3]:.6f}, ||ΔW||={last[4]:.6f}")
+
+    # Final verdict
+    if non_zero_count > 0:
+        print("  VERDICT: LoRA trained weights ARE being applied during inference.")
+    else:
+        print("  VERDICT: LoRA weights are all zero — effectively NO LoRA applied!")
+    print("=" * 60 + "\n")
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
@@ -681,14 +783,19 @@ def main() -> None:
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    print("==> [Data] Loading training prompts.")
-    prompts = load_alpaca_prompts(args.train_samples)
+    print(f"==> [Data] Loading training prompts (finetune_type={args.finetune_type}).")
+    if args.finetune_type == "harmful":
+        harmful_data_path = REPO_ROOT / "lowrank_prune" / "data" / "pure_bad_all.jsonl"
+        if not harmful_data_path.exists():
+            raise FileNotFoundError(f"Harmful dataset not found: {harmful_data_path}")
+        prompts = load_harmful_prompts(harmful_data_path, args.train_samples)
+    else:
+        prompts = load_alpaca_prompts(args.train_samples)
     dataset = Dataset.from_dict({"text": prompts})
 
     def tokenize_fn(batch):
         return tokenizer(
             batch["text"],
-            padding="max_length",
             truncation=True,
             max_length=args.max_length,
         )
@@ -725,6 +832,9 @@ def main() -> None:
         model.eval()
         model.config.use_cache = True
         model.seqlen = 4096
+
+        # Log whether LoRA weights are active during inference
+        log_lora_inference_status(model)
 
         # Evaluate PPL
         ppl = eval_ppl(args, model, tokenizer, device=device)
