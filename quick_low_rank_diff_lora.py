@@ -53,11 +53,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--safety_lambda", type=float, default=0.1)
-    parser.add_argument("--us_energy_threshold", type=float, default=0.9,
-                        help="Energy threshold for U_s rank truncation. Keep top singular vectors "
-                             "capturing this fraction of total energy (sum of squared singular values). "
-                             "Lower values = fewer directions = stronger steering signal. "
-                             "Default 0.9 keeps ~90%% energy. Set to 1.0 to keep all (old behavior).")
+    parser.add_argument("--us_energy_threshold", type=float, default=None,
+                        help="Optional energy threshold for U_s rank truncation. "
+                             "If set, keep top singular vectors capturing this fraction of total "
+                             "energy (sum of squared singular values) instead of tolerance-based "
+                             "truncation. E.g., 0.9 keeps ~90%% energy.")
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--output_dir", type=str, default="out/quick_low_rank_diff_lora")
     parser.add_argument("--run_eval", action="store_true", default=True)
@@ -162,7 +162,10 @@ def compute_delta_w(
             _, _, vp = torch.svd_lowrank(
                 score_p.float(), q=total_rank - rank_pos, niter=niter
             )
-            vp_proj = (vp @ vp.T).type(module.base.weight.data.dtype)
+            # Keep projections in float32 to preserve rank structure.
+            # Casting to float16 here introduced noise >> float32 SVD tolerance,
+            # inflating the apparent rank from ~96 to ~4096.
+            vp_proj = vp @ vp.T  # float32
 
             activation_norms_n = torch.cat(activation_norms_neg[name], dim=0).to(
                 weight_device
@@ -171,12 +174,11 @@ def compute_delta_w(
             _, _, vn = torch.svd_lowrank(
                 score_n.float(), q=total_rank - rank_neg, niter=niter
             )
-            vn_proj = (vn @ vn.T).type(module.base.weight.data.dtype)
+            vn_proj = vn @ vn.T  # float32
 
-            vp_proj_ortho = (torch.eye(d_out, device=weight_device) - vp_proj).type(
-                module.base.weight.data.dtype
-            )
-            delta_w = vp_proj_ortho @ (vn_proj @ module.base.weight.data)
+            vp_proj_ortho = torch.eye(d_out, device=weight_device, dtype=torch.float32) - vp_proj
+            weight_f32 = module.base.weight.data.float()
+            delta_w = vp_proj_ortho @ (vn_proj @ weight_f32)
             delta_w_map[name] = delta_w.detach().cpu()
 
         for name, module in model.named_modules():
@@ -645,32 +647,38 @@ def main() -> None:
             delta_w_path,
         )
 
-    us_map_tag = f"e{args.us_energy_threshold:.2f}"
+    if args.us_energy_threshold is not None:
+        us_map_tag = f"e{args.us_energy_threshold:.2f}"
+    else:
+        us_map_tag = "tol"
     us_map_path = Path(args.output_dir) / f"us_map_{us_map_tag}.pt"
     if us_map_path.exists():
         print(f"==> [ΔW] Loading existing U_s map from {us_map_path}.")
         us_map = torch.load(us_map_path)
     else:
-        print(f"==> [ΔW] Building U_s bases via SVD (energy_threshold={args.us_energy_threshold}).")
+        truncation_mode = f"energy_threshold={args.us_energy_threshold}" if args.us_energy_threshold else "tolerance"
+        print(f"==> [ΔW] Building U_s bases via SVD ({truncation_mode}).")
         us_map = {}
         rank_stats = []
         for name, delta_w in delta_w_map.items():
             u, s, _ = torch.linalg.svd(delta_w.float(), full_matrices=False)
-            # Energy-based rank truncation: keep top-k singular vectors
-            # capturing us_energy_threshold fraction of total ||ΔW||_F^2
-            energy = s ** 2
-            total_energy = energy.sum()
-            cumulative_energy = torch.cumsum(energy, dim=0)
-            # Find smallest k such that cumulative_energy[k-1] >= threshold * total_energy
-            rank = int((cumulative_energy < args.us_energy_threshold * total_energy).sum().item()) + 1
-            rank = min(rank, len(s))  # clamp to total number of singular values
+            if args.us_energy_threshold is not None:
+                # Energy-based: keep top-k capturing threshold fraction of ||ΔW||_F^2
+                energy = s ** 2
+                total_energy = energy.sum()
+                cumulative_energy = torch.cumsum(energy, dim=0)
+                rank = int((cumulative_energy < args.us_energy_threshold * total_energy).sum().item()) + 1
+                rank = min(rank, len(s))
+            else:
+                # Tolerance-based: keep singular values above numerical noise floor
+                tol = torch.finfo(s.dtype).eps * max(delta_w.shape) * s.max()
+                rank = int(torch.sum(s > tol).item())
             us_map[name] = u[:, :rank]
-            energy_captured = cumulative_energy[rank - 1].item() / total_energy.item()
             rank_stats.append(rank)
             if 'layers.0.' in name or 'layers.1.' in name:
+                s_next = s[rank].item() if rank < len(s) else 0.0
                 print(f"    {name}: shape={delta_w.shape}, us_rank={rank}/{len(s)}, "
-                      f"energy_captured={energy_captured:.4f}, "
-                      f"s_max={s[0]:.4f}, s[rank-1]={s[rank-1]:.6f}")
+                      f"s_max={s[0]:.4f}, s[{rank-1}]={s[rank-1]:.6f}, s[{rank}]={s_next:.6f}")
         avg_rank = sum(rank_stats) / len(rank_stats) if rank_stats else 0
         max_dim = max((delta_w_map[n].shape[0] for n in delta_w_map), default=0)
         print(f"==> [ΔW] U_s rank stats: avg={avg_rank:.1f}, min={min(rank_stats)}, "
