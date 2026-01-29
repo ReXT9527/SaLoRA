@@ -697,7 +697,7 @@ def main() -> None:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         logging_steps=10,
-        save_steps=200,
+        save_steps=2000,
         report_to="none",
     )
 
@@ -740,7 +740,7 @@ def main() -> None:
         gc.collect()  # Second gc pass to catch any remaining references
 
         harmful_rate = evaluate_with_llama_guard(
-            original_prompts, model_outputs, tensor_parallel_size=args.llama_guard_tp
+            original_prompts, model_outputs
         )
         if harmful_rate >= 0:
             safety_rate = 1.0 - harmful_rate
