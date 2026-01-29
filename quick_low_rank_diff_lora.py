@@ -54,9 +54,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--finetune_type", type=str, default="harmless", choices=["harmful", "harmless"],
                         help="Type of fine-tuning: 'harmful' uses pure_bad_all.jsonl, 'harmless' uses alpaca-cleaned.")
     parser.add_argument("--train_samples", type=int, default=256, help="Number of training samples. 0 means use full dataset.")
-    parser.add_argument("--train_batch_size", type=int, default=64)
-    parser.add_argument("--train_epochs", type=int, default=1)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--train_batch_size", type=int, default=4)
+    parser.add_argument("--train_epochs", type=int, default=5)
+    parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--safety_lambda", type=float, default=0.1)
     parser.add_argument("--max_length", type=int, default=2048)
@@ -542,6 +542,17 @@ def evaluate_harm_refusal(
             results.append(1 if refused else 0)
 
     refusal_rate = float(sum(results)) / max(len(results), 1)
+
+    # Print sample outputs for debugging
+    num_show = min(5, len(model_outputs))
+    print(f"\n    --- Sample model outputs ({num_show}/{len(model_outputs)}) ---")
+    for i in range(num_show):
+        tag = "REFUSED" if results[i] else "ANSWERED"
+        output_preview = model_outputs[i][:200].replace("\n", " ")
+        print(f"    [{tag}] Q: {original_prompts[i][:80]}...")
+        print(f"           A: {output_preview}...")
+    print(f"    ---\n")
+
     return refusal_rate, original_prompts, model_outputs
 
 
@@ -804,13 +815,29 @@ def main() -> None:
     tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
     tokenized = tokenized.map(group_texts, batched=True, batch_size=1024)
 
+    num_train_samples = len(tokenized)
+    steps_per_epoch = max(1, num_train_samples // args.train_batch_size)
+    total_steps = steps_per_epoch * args.train_epochs
+    print(f"==> [Train] Config summary:")
+    print(f"    finetune_type:     {args.finetune_type}")
+    print(f"    train samples:     {num_train_samples} (blocks of 128 tokens)")
+    print(f"    batch_size:        {args.train_batch_size}")
+    print(f"    epochs:            {args.train_epochs}")
+    print(f"    learning_rate:     {args.learning_rate}")
+    print(f"    safety_lambda:     {args.safety_lambda}")
+    print(f"    steps_per_epoch:   {steps_per_epoch}")
+    print(f"    total_steps:       ~{total_steps}")
+    if total_steps < 50:
+        print(f"    WARNING: Only ~{total_steps} gradient steps. "
+              f"Consider lowering --train_batch_size or increasing --train_epochs.")
+
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.train_batch_size,
         num_train_epochs=args.train_epochs,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
-        logging_steps=10,
+        logging_steps=1,
         save_steps=2000,
         report_to="none",
     )
