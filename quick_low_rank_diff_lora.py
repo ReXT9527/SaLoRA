@@ -56,6 +56,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--output_dir", type=str, default="out/quick_low_rank_diff_lora")
     parser.add_argument("--run_eval", action="store_true", default=True)
+    parser.add_argument(
+        "--finetune_data",
+        type=str,
+        default="harmless",
+        choices=["harmless", "harmful"],
+        help="Choose fine-tuning data: 'harmless' uses alpaca-cleaned (default), 'harmful' uses walledai/HarmBench.",
+    )
     return parser.parse_args()
 
 
@@ -197,6 +204,39 @@ def load_alpaca_prompts(sample_count: int = 0) -> List[str]:
         input_text = row["input"].strip()
         output_text = row["output"].strip()
         prompts.append(f"[INST]{instruction} {input_text}[/INST]{output_text}")
+    return prompts
+
+
+def load_harmbench_prompts(sample_count: int = 0) -> List[str]:
+    """Load HarmBench harmful prompts from walledai/HarmBench (standard + contextual).
+
+    Formats each prompt as [INST]{prompt}[/INST] for harmful fine-tuning.
+    If sample_count <= 0, load all samples.
+    """
+    prompts: List[str] = []
+
+    # Load standard split (200 examples): columns = prompt, category
+    ds_standard = load_dataset("walledai/HarmBench", "standard", split="train")
+    print(f"    Loaded {len(ds_standard)} standard HarmBench samples.")
+    for row in ds_standard:
+        prompt_text = row["prompt"].strip()
+        prompts.append(f"[INST]{prompt_text}[/INST]")
+
+    # Load contextual split (100 examples): columns = prompt, context, category
+    ds_contextual = load_dataset("walledai/HarmBench", "contextual", split="train")
+    print(f"    Loaded {len(ds_contextual)} contextual HarmBench samples.")
+    for row in ds_contextual:
+        prompt_text = row["prompt"].strip()
+        context_text = row["context"].strip()
+        if context_text:
+            prompts.append(f"[INST]{prompt_text}\n\nContext: {context_text}[/INST]")
+        else:
+            prompts.append(f"[INST]{prompt_text}[/INST]")
+
+    if sample_count > 0:
+        prompts = prompts[: min(sample_count, len(prompts))]
+
+    print(f"    Total HarmBench training samples: {len(prompts)}")
     return prompts
 
 
@@ -657,8 +697,12 @@ def main() -> None:
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    print("==> [Data] Loading alpaca-cleaned training prompts.")
-    prompts = load_alpaca_prompts(args.train_samples)
+    if args.finetune_data == "harmful":
+        print("==> [Data] Loading HarmBench harmful training prompts.")
+        prompts = load_harmbench_prompts(args.train_samples)
+    else:
+        print("==> [Data] Loading alpaca-cleaned harmless training prompts.")
+        prompts = load_alpaca_prompts(args.train_samples)
     dataset = Dataset.from_dict({"text": prompts})
 
     def tokenize_fn(batch):
