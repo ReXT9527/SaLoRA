@@ -53,6 +53,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--safety_lambda", type=float, default=0.1)
+    parser.add_argument("--us_energy_threshold", type=float, default=0.9,
+                        help="Energy threshold for U_s rank truncation. Keep top singular vectors "
+                             "capturing this fraction of total energy (sum of squared singular values). "
+                             "Lower values = fewer directions = stronger steering signal. "
+                             "Default 0.9 keeps ~90%% energy. Set to 1.0 to keep all (old behavior).")
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--output_dir", type=str, default="out/quick_low_rank_diff_lora")
     parser.add_argument("--run_eval", action="store_true", default=True)
@@ -281,7 +286,9 @@ class SafetyLoraTrainer(Trainer):
                 dw_norm = torch.sqrt(dw_norm_sq - 1e-8).item()
                 proj_norm = torch.sqrt(proj_norm_sq).item()
                 us_rank = us.shape[1]
-                print(f"    [Debug] {name}: us_rank={us_rank}, ||ΔW||={dw_norm:.6f}, ||proj||={proj_norm:.6f}, ratio={normalized_penalty.item():.4f}")
+                d_out = us.shape[0]
+                print(f"    [Debug] {name}: us_rank={us_rank}/{d_out} ({us_rank/d_out*100:.1f}% of space), "
+                      f"||ΔW||={dw_norm:.6f}, ||proj||={proj_norm:.6f}, ratio={normalized_penalty.item():.4f}")
 
             # Move to accumulate device to handle multi-GPU setups
             normalized_penalty = normalized_penalty.to(accumulate_device)
@@ -638,21 +645,36 @@ def main() -> None:
             delta_w_path,
         )
 
-    us_map_path = Path(args.output_dir) / "us_map.pt"
+    us_map_tag = f"e{args.us_energy_threshold:.2f}"
+    us_map_path = Path(args.output_dir) / f"us_map_{us_map_tag}.pt"
     if us_map_path.exists():
         print(f"==> [ΔW] Loading existing U_s map from {us_map_path}.")
         us_map = torch.load(us_map_path)
     else:
-        print("==> [ΔW] Building rank-truncated U_s bases via SVD.")
+        print(f"==> [ΔW] Building U_s bases via SVD (energy_threshold={args.us_energy_threshold}).")
         us_map = {}
+        rank_stats = []
         for name, delta_w in delta_w_map.items():
             u, s, _ = torch.linalg.svd(delta_w.float(), full_matrices=False)
-            tol = torch.finfo(s.dtype).eps * max(delta_w.shape) * s.max()
-            rank = int(torch.sum(s > tol).item())
+            # Energy-based rank truncation: keep top-k singular vectors
+            # capturing us_energy_threshold fraction of total ||ΔW||_F^2
+            energy = s ** 2
+            total_energy = energy.sum()
+            cumulative_energy = torch.cumsum(energy, dim=0)
+            # Find smallest k such that cumulative_energy[k-1] >= threshold * total_energy
+            rank = int((cumulative_energy < args.us_energy_threshold * total_energy).sum().item()) + 1
+            rank = min(rank, len(s))  # clamp to total number of singular values
             us_map[name] = u[:, :rank]
-            # Debug: print rank info for first few layers
+            energy_captured = cumulative_energy[rank - 1].item() / total_energy.item()
+            rank_stats.append(rank)
             if 'layers.0.' in name or 'layers.1.' in name:
-                print(f"    {name}: shape={delta_w.shape}, rank={rank}, s_max={s.max():.4f}, s_min={s.min():.6f}")
+                print(f"    {name}: shape={delta_w.shape}, us_rank={rank}/{len(s)}, "
+                      f"energy_captured={energy_captured:.4f}, "
+                      f"s_max={s[0]:.4f}, s[rank-1]={s[rank-1]:.6f}")
+        avg_rank = sum(rank_stats) / len(rank_stats) if rank_stats else 0
+        max_dim = max((delta_w_map[n].shape[0] for n in delta_w_map), default=0)
+        print(f"==> [ΔW] U_s rank stats: avg={avg_rank:.1f}, min={min(rank_stats)}, "
+              f"max={max(rank_stats)}, out of {max_dim} dimensions")
         print(f"==> [ΔW] Saving U_s map to {us_map_path}.")
         torch.save(us_map, us_map_path)
 
