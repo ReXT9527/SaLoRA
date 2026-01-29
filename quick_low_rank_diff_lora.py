@@ -14,6 +14,9 @@ from peft.tuners.lora.layer import LoraLayer
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
 
+import warnings
+warnings.filterwarnings("ignore")
+
 REPO_ROOT = Path(__file__).resolve().parent
 sys.path.append(str(REPO_ROOT))
 sys.path.append(str(REPO_ROOT / "lowrank_prune"))
@@ -37,32 +40,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rank_pos", type=int, default=3000)
     parser.add_argument("--rank_neg", type=int, default=4000)
     parser.add_argument("--prune_data_pos", type=str, default="alpaca_cleaned_no_safety")
-    parser.add_argument("--prune_data_neg", type=str, default="align_short")
+    parser.add_argument("--prune_data_neg", type=str, default="align")
     parser.add_argument("--nsamples", type=int, default=128)
-    parser.add_argument("--niter", type=int, default=20)
+    parser.add_argument("--niter", type=int, default=30)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--device_map", type=str, default="auto")
     parser.add_argument("--delta_w_path", type=str, default="out/delta_w_safety.pt")
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=16)
-    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--lora_dropout", type=float, default=0)
     parser.add_argument("--target_modules", type=str, default="q_proj,v_proj")
-    parser.add_argument("--train_samples", type=int, default=0, help="Number of training samples. 0 means use full dataset.")
-    parser.add_argument("--train_batch_size", type=int, default=2)
+    parser.add_argument("--train_samples", type=int, default=256, help="Number of training samples. 0 means use full dataset.")
+    parser.add_argument("--train_batch_size", type=int, default=64)
     parser.add_argument("--train_epochs", type=int, default=1)
-    parser.add_argument("--learning_rate", type=float, default=2e-4)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--safety_lambda", type=float, default=0.1)
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--output_dir", type=str, default="out/quick_low_rank_diff_lora")
     parser.add_argument("--run_eval", action="store_true", default=True)
-    parser.add_argument(
-        "--finetune_data",
-        type=str,
-        default="harmless",
-        choices=["harmless", "harmful"],
-        help="Choose fine-tuning data: 'harmless' uses alpaca-cleaned (default), 'harmful' uses walledai/HarmBench.",
-    )
     return parser.parse_args()
 
 
@@ -164,7 +160,10 @@ def compute_delta_w(
             _, _, vp = torch.svd_lowrank(
                 score_p.float(), q=total_rank - rank_pos, niter=niter
             )
-            vp_proj = (vp @ vp.T).type(module.base.weight.data.dtype)
+            # Keep projections in float32 to preserve rank structure.
+            # Casting to float16 here introduced noise >> float32 SVD tolerance,
+            # inflating the apparent rank from ~96 to ~4096.
+            vp_proj = vp @ vp.T  # float32
 
             activation_norms_n = torch.cat(activation_norms_neg[name], dim=0).to(
                 weight_device
@@ -173,12 +172,11 @@ def compute_delta_w(
             _, _, vn = torch.svd_lowrank(
                 score_n.float(), q=total_rank - rank_neg, niter=niter
             )
-            vn_proj = (vn @ vn.T).type(module.base.weight.data.dtype)
+            vn_proj = vn @ vn.T  # float32
 
-            vp_proj_ortho = (torch.eye(d_out, device=weight_device) - vp_proj).type(
-                module.base.weight.data.dtype
-            )
-            delta_w = vp_proj_ortho @ (vn_proj @ module.base.weight.data)
+            vp_proj_ortho = torch.eye(d_out, device=weight_device, dtype=torch.float32) - vp_proj
+            weight_f32 = module.base.weight.data.float()
+            delta_w = vp_proj_ortho @ (vn_proj @ weight_f32)
             delta_w_map[name] = delta_w.detach().cpu()
 
         for name, module in model.named_modules():
@@ -204,39 +202,6 @@ def load_alpaca_prompts(sample_count: int = 0) -> List[str]:
         input_text = row["input"].strip()
         output_text = row["output"].strip()
         prompts.append(f"[INST]{instruction} {input_text}[/INST]{output_text}")
-    return prompts
-
-
-def load_harmbench_prompts(sample_count: int = 0) -> List[str]:
-    """Load HarmBench harmful prompts from walledai/HarmBench (standard + contextual).
-
-    Formats each prompt as [INST]{prompt}[/INST] for harmful fine-tuning.
-    If sample_count <= 0, load all samples.
-    """
-    prompts: List[str] = []
-
-    # Load standard split (200 examples): columns = prompt, category
-    ds_standard = load_dataset("walledai/HarmBench", "standard", split="train")
-    print(f"    Loaded {len(ds_standard)} standard HarmBench samples.")
-    for row in ds_standard:
-        prompt_text = row["prompt"].strip()
-        prompts.append(f"[INST]{prompt_text}[/INST]")
-
-    # Load contextual split (100 examples): columns = prompt, context, category
-    ds_contextual = load_dataset("walledai/HarmBench", "contextual", split="train")
-    print(f"    Loaded {len(ds_contextual)} contextual HarmBench samples.")
-    for row in ds_contextual:
-        prompt_text = row["prompt"].strip()
-        context_text = row["context"].strip()
-        if context_text:
-            prompts.append(f"[INST]{prompt_text}\n\nContext: {context_text}[/INST]")
-        else:
-            prompts.append(f"[INST]{prompt_text}[/INST]")
-
-    if sample_count > 0:
-        prompts = prompts[: min(sample_count, len(prompts))]
-
-    print(f"    Total HarmBench training samples: {len(prompts)}")
     return prompts
 
 
@@ -267,7 +232,7 @@ class SafetyLoraTrainer(Trainer):
         if self.safety_lambda != 0:
             penalty = self._safety_penalty(model, debug_step=self._step_count)
             # Ensure penalty is on the same device as loss (for multi-GPU setups)
-            if self.state.global_step < 10:
+            if self.state.global_step < 1000:
                 print(f"Step {self.state.global_step}: L_CE={outputs.loss.item():.4f}, penalty={penalty.item():.4f}")
             penalty = penalty.to(loss.device)
             # λ > 0: penalize projection onto safety subspace (keep safe)
@@ -315,13 +280,16 @@ class SafetyLoraTrainer(Trainer):
             # Range: [0, 1] per layer, regardless of ΔW magnitude
             dw_norm_sq = torch.norm(delta_weight, p="fro") ** 2 + 1e-8
             normalized_penalty = proj_norm_sq / dw_norm_sq
+            
 
             # Debug info for first layer
             if debug_step == 0 and 'layers.0.' in name and 'q_proj' in name:
                 dw_norm = torch.sqrt(dw_norm_sq - 1e-8).item()
                 proj_norm = torch.sqrt(proj_norm_sq).item()
                 us_rank = us.shape[1]
-                print(f"    [Debug] {name}: us_rank={us_rank}, ||ΔW||={dw_norm:.6f}, ||proj||={proj_norm:.6f}, ratio={normalized_penalty.item():.4f}")
+                d_out = us.shape[0]
+                print(f"    [Debug] {name}: us_rank={us_rank}/{d_out} ({us_rank/d_out*100:.1f}% of space), "
+                      f"||ΔW||={dw_norm:.6f}, ||proj||={proj_norm:.6f}, ratio={normalized_penalty.item():.4f}")
 
             # Move to accumulate device to handle multi-GPU setups
             normalized_penalty = normalized_penalty.to(accumulate_device)
@@ -526,6 +494,7 @@ def evaluate_harm_refusal(
     model.eval()
     print(f"    Evaluating {len(prompts)} harmful prompts...")
     with torch.no_grad():
+        # prompts = prompts[:2]
         for prompt in tqdm(prompts, desc="Generating responses"):
             input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
             outputs = model.generate(
@@ -689,10 +658,12 @@ def main() -> None:
             u, s, _ = torch.linalg.svd(delta_w.float(), full_matrices=False)
             tol = torch.finfo(s.dtype).eps * max(delta_w.shape) * s.max()
             rank = int(torch.sum(s > tol).item())
+            print("==> [rank] us rank is:    ", rank)
             us_map[name] = u[:, :rank]
-            # Debug: print rank info for first few layers
             if 'layers.0.' in name or 'layers.1.' in name:
-                print(f"    {name}: shape={delta_w.shape}, rank={rank}, s_max={s.max():.4f}, s_min={s.min():.6f}")
+                s_next = s[rank].item() if rank < len(s) else 0.0
+                print(f"    {name}: shape={delta_w.shape}, us_rank={rank}/{len(s)}, "
+                      f"s_max={s[0]:.4f}, s[{rank-1}]={s[rank-1]:.6f}, s[{rank}]={s_next:.6f}")
         print(f"==> [ΔW] Saving U_s map to {us_map_path}.")
         torch.save(us_map, us_map_path)
 
@@ -703,18 +674,15 @@ def main() -> None:
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         target_modules=target_modules,
+        inference_mode=False,
         task_type="CAUSAL_LM",
         bias="none",
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    if args.finetune_data == "harmful":
-        print("==> [Data] Loading HarmBench harmful training prompts.")
-        prompts = load_harmbench_prompts(args.train_samples)
-    else:
-        print("==> [Data] Loading alpaca-cleaned harmless training prompts.")
-        prompts = load_alpaca_prompts(args.train_samples)
+    print("==> [Data] Loading training prompts.")
+    prompts = load_alpaca_prompts(args.train_samples)
     dataset = Dataset.from_dict({"text": prompts})
 
     def tokenize_fn(batch):
@@ -736,7 +704,7 @@ def main() -> None:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         logging_steps=10,
-        save_steps=200,
+        save_steps=2000,
         report_to="none",
     )
 
@@ -779,7 +747,7 @@ def main() -> None:
         gc.collect()  # Second gc pass to catch any remaining references
 
         harmful_rate = evaluate_with_llama_guard(
-            original_prompts, model_outputs, tensor_parallel_size=args.llama_guard_tp
+            original_prompts, model_outputs
         )
         if harmful_rate >= 0:
             safety_rate = 1.0 - harmful_rate
@@ -800,3 +768,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
