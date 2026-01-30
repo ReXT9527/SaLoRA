@@ -59,7 +59,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--safety_lambda", type=float, default=0.1)
-    parser.add_argument("--output_dir", type=str, default="out/quick_low_rank_diff_lora")
+    parser.add_argument("--output_dir", type=str, default="out/quick_low_rank_diff_lora",
+                        help="Root output directory. The final run directory appends finetune_type + checkpoint_name.")
+    parser.add_argument("--checkpoint_name", type=str, default="checkpoint",
+                        help="Checkpoint name appended to output_dir along with finetune_type.")
     parser.add_argument("--run_eval", action="store_true", default=True)
     return parser.parse_args()
 
@@ -762,7 +765,11 @@ def main() -> None:
 
     print("==> [Init] Preparing output directories and tokenizer.")
     os.makedirs(Path(args.delta_w_path).parent, exist_ok=True)
-    os.makedirs(args.output_dir, exist_ok=True)
+    base_out = Path(args.output_dir)
+    checkpoint_name = args.checkpoint_name
+    run_dir = base_out / f"{args.finetune_type}_{checkpoint_name}"
+    args.output_dir = str(run_dir)
+    os.makedirs(run_dir, exist_ok=True)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     tokenizer.pad_token = tokenizer.eos_token
