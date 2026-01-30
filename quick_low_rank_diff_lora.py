@@ -325,10 +325,15 @@ class SafetyLoraTrainer(Trainer):
         Computes the fraction of LoRA-induced activation change that falls
         into the safety subspace, for the current batch:
 
-            penalty_l = ||U_s^T @ ΔW_l @ X_l||_F^2  
+            penalty_l = ||U_s^T @ ΔW_l @ X_l||_F^2
 
-        Content-aware: harmful inputs that activate safety-relevant directions
-        produce larger numerators → larger penalty.  
+        Optimised decomposition (avoids forming the full d_out×d_in matrix):
+            ΔW = scaling * B @ A
+            U_s^T @ ΔW @ X^T = scaling * (U_s^T @ B) @ (A @ X^T)
+              (1) T = A @ X^T          (r, N)        cost: r·d_in·N
+              (2) M = U_s^T @ B        (r_s, r)      cost: r_s·d_out·r
+              (3) P = M @ T            (r_s, N)       cost: r_s·r·N
+        All intermediate products are computed in float32 for numerical stability.
         """
         accumulate_device = next(model.parameters()).device
         penalty = None
@@ -342,20 +347,30 @@ class SafetyLoraTrainer(Trainer):
             if name not in self._activation_cache:
                 continue
 
-            # Input activation (detached — gradient flows only through ΔW)
+            # Input activation (detached — gradient flows only through A, B)
             X = self._activation_cache[name]           # (batch, seq_len, d_in)
             X_flat = X.reshape(-1, X.shape[-1])        # (N, d_in)
 
-            # LoRA delta weight (in computation graph for gradient to A, B)
-            delta_weight = module.get_delta_weight("default")  # (d_out, d_in)
-            X_flat = X_flat.to(delta_weight.dtype)
+            # Extract LoRA components (keeps autograd graph for A, B)
+            A = module.lora_A["default"].weight         # (r, d_in)
+            B = module.lora_B["default"].weight         # (d_out, r)
+            scaling = module.scaling["default"]          # scalar
 
-            # Δh = ΔW @ X^T — full activation change due to LoRA
-            delta_h = delta_weight @ X_flat.T           # (d_out, N)
+            # Cast everything to float32 for numerical stability
+            A_f32 = A.float()                           # (r, d_in)
+            B_f32 = B.float()                           # (d_out, r)
+            X_f32 = X_flat.float()                      # (N, d_in)
+            us = self.us_map[original_name].to(A.device).float()  # (d_out, r_s)
 
-            # Numerator: project Δh onto safety subspace
-            us = self.us_map[original_name].to(delta_h.device, delta_h.dtype)
-            proj = us.T @ delta_h                       # (r, N)
+            # (1) T = A @ X^T  -> (r, N)
+            T = A_f32 @ X_f32.T
+
+            # (2) M = U_s^T @ B  -> (r_s, r)
+            M = us.T @ B_f32
+
+            # (3) P = M @ T  -> (r_s, N),  then apply LoRA scaling
+            proj = (M @ T) * scaling                    # (r_s, N)
+
             proj_norm_sq = (proj ** 2).sum()
             layer_penalty = proj_norm_sq
 
@@ -363,7 +378,11 @@ class SafetyLoraTrainer(Trainer):
                 with torch.no_grad():
                     us_rank = us.shape[1]
                     d_out = us.shape[0]
-                    dw_norm = torch.norm(delta_weight).item()
+                    # Compute ||ΔW||_F efficiently via r×r intermediates:
+                    # ||ΔW||_F^2 = s^2 * tr((B^T B)(A A^T))
+                    BtB = B_f32.T @ B_f32               # (r, r)
+                    AAt = A_f32 @ A_f32.T                # (r, r)
+                    dw_norm = (scaling * torch.sqrt((BtB * AAt).sum())).item()
                     proj_norm = torch.sqrt(proj_norm_sq).item()
                     print(f"    [Debug] {name}: us_rank={us_rank}/{d_out} ({us_rank/d_out*100:.1f}%), "
                           f"||ΔW||={dw_norm:.6f}, "
@@ -805,18 +824,18 @@ def main() -> None:
     device = torch.device(args.device)
 
     print("==> [Init] Preparing output directories and tokenizer.")
-    checkpoint_name = (f"lambda_{args.safety_lambda}")
-    lora_name = f"Lora_lambda_{args.safety_lambda}"
-    base_out = Path(args.output_dir) / args.finetune_type
-    run_output_dir = base_out / checkpoint_name
+    run_name = (
+        f"{args.finetune_type}_lambda_{args.safety_lambda}"
+        f"_{args.train_epochs}_{args.train_batch_size}_{args.lora_r}"
+    )
+    run_output_dir = Path(args.output_dir) / run_name
     lora_output_dir = run_output_dir / "Lora"
 
     os.makedirs(Path(args.delta_w_path).parent, exist_ok=True)
     run_output_dir.mkdir(parents=True, exist_ok=True)
     lora_output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"    Base output dir: {base_out}")
-    print(f"    Checkpoint dir:  {run_output_dir}")
-    print(f"    LoRA name:       {lora_name}")
+    print(f"    Run name:        {run_name}")
+    print(f"    Run output dir:  {run_output_dir}")
     print(f"    LoRA dir:        {lora_output_dir}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
@@ -947,7 +966,7 @@ def main() -> None:
         logging_steps=10,
         save_steps=500,
         report_to="none",
-        run_name=lora_name,
+        run_name=run_name,
     )
 
     print("==> [Train] Starting LoRA fine-tuning with orthogonal constraint.")
