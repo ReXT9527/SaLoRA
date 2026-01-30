@@ -761,8 +761,21 @@ def main() -> None:
     device = torch.device(args.device)
 
     print("==> [Init] Preparing output directories and tokenizer.")
+    checkpoint_name = (
+        f"{args.finetune_type}_lambda_{args.safety_lambda}_{args.train_samples}"
+    )
+    lora_name = f"Lora_{args.finetune_type}_lambda_{args.safety_lambda}_{args.train_samples}"
+    base_out = Path(args.output_dir) / args.finetune_type
+    run_output_dir = base_out / checkpoint_name
+    lora_output_dir = run_output_dir / "Lora"
+
     os.makedirs(Path(args.delta_w_path).parent, exist_ok=True)
-    os.makedirs(args.output_dir, exist_ok=True)
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+    lora_output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"    Base output dir: {base_out}")
+    print(f"    Checkpoint dir:  {run_output_dir}")
+    print(f"    LoRA name:       {lora_name}")
+    print(f"    LoRA dir:        {lora_output_dir}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     tokenizer.pad_token = tokenizer.eos_token
@@ -872,7 +885,7 @@ def main() -> None:
               f"Consider lowering --train_batch_size or increasing --train_epochs.")
 
     training_args = TrainingArguments(
-        output_dir=args.output_dir,
+        output_dir=str(run_output_dir),
         per_device_train_batch_size=args.train_batch_size,
         num_train_epochs=args.train_epochs,
         learning_rate=args.learning_rate,
@@ -880,6 +893,7 @@ def main() -> None:
         logging_steps=1,
         save_steps=2000,
         report_to="none",
+        run_name=lora_name,
     )
 
     print("==> [Train] Starting LoRA fine-tuning with orthogonal constraint.")
@@ -892,8 +906,8 @@ def main() -> None:
     )
     trainer.train()
     trainer._remove_activation_hooks()
-    print(f"==> [Train] Saving LoRA adapter to {args.output_dir}.")
-    model.save_pretrained(args.output_dir)
+    print(f"==> [Train] Saving LoRA adapter to {lora_output_dir}.")
+    model.save_pretrained(lora_output_dir)
 
     if args.run_eval:
         print("==> [Eval] Running wikitext PPL and harm_test refusal evaluation.")
