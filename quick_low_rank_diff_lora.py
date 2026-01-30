@@ -765,17 +765,20 @@ def main() -> None:
 
     print("==> [Init] Preparing output directories and tokenizer.")
     checkpoint_name = (
-        f"checkpoint_{args.finetune_type}_lambda_{args.safety_lambda}_{args.train_samples}"
+        f"{args.finetune_type}_lambda_{args.safety_lambda}_{args.train_samples}"
     )
     lora_name = f"Lora_{args.finetune_type}_lambda_{args.safety_lambda}_{args.train_samples}"
     base_out = Path(args.output_dir) / args.finetune_type
     run_output_dir = base_out / checkpoint_name
+    lora_output_dir = run_output_dir / "Lora"
 
     os.makedirs(Path(args.delta_w_path).parent, exist_ok=True)
     run_output_dir.mkdir(parents=True, exist_ok=True)
+    lora_output_dir.mkdir(parents=True, exist_ok=True)
     print(f"    Base output dir: {base_out}")
     print(f"    Checkpoint dir:  {run_output_dir}")
     print(f"    LoRA name:       {lora_name}")
+    print(f"    LoRA dir:        {lora_output_dir}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     tokenizer.pad_token = tokenizer.eos_token
@@ -906,8 +909,8 @@ def main() -> None:
     )
     trainer.train()
     trainer._remove_activation_hooks()
-    print(f"==> [Train] Saving LoRA adapter to {run_output_dir}.")
-    model.save_pretrained(run_output_dir)
+    print(f"==> [Train] Saving LoRA adapter to {lora_output_dir}.")
+    model.save_pretrained(lora_output_dir)
 
     if args.run_eval:
         print("==> [Eval] Running wikitext PPL and harm_test refusal evaluation.")
