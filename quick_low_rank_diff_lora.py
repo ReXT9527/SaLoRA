@@ -263,6 +263,7 @@ class SafetyLoraTrainer(Trainer):
 
     def _register_activation_hooks(self) -> None:
         """Register forward hooks on LoRA layers to capture input activations."""
+        self._remove_activation_hooks()  # Remove any existing hooks first
         print("==> [SafetyLoraTrainer] Registering activation hooks on LoRA layers...")
         hook_count = 0
         for name, module in self.model.named_modules():
@@ -274,6 +275,13 @@ class SafetyLoraTrainer(Trainer):
             self._hooks.append(hook)
             hook_count += 1
         print(f"    Registered {hook_count} activation hooks for dynamic penalty.")
+
+    def _remove_activation_hooks(self) -> None:
+        """Remove all registered activation hooks and clear cache."""
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks.clear()
+        self._activation_cache.clear()
 
     def _make_activation_hook(self, name: str):
         """Create a hook that captures input activation (detached) for the given layer."""
@@ -311,18 +319,13 @@ class SafetyLoraTrainer(Trainer):
     def _safety_penalty(self, model, debug_step: int = -1) -> torch.Tensor:
         """Dynamic activation-based safety penalty.
 
-        Instead of the static ||U_s^T @ ΔW||² (independent of input),
-        compute ||U_s^T @ ΔW @ X||² / N — the actual activation change
-        in safety directions for the current batch.
+        Computes the fraction of LoRA-induced activation change that falls
+        into the safety subspace, for the current batch:
 
-        This is content-aware: harmful inputs that activate safety-relevant
-        directions produce larger penalties automatically.
+            penalty_l = ||U_s^T @ ΔW_l @ X_l||_F^2  /  ||ΔW_l @ X_l||_F^2
 
-        Efficient computation avoids materializing the full (d_out, N) tensor:
-            M = U_s^T @ ΔW        ->  (r, d_in),  r ≈ 96
-            proj = M @ X^T         ->  (r, N),     N = batch*seq_len
-            penalty = ||proj||² / N
-        Memory per layer: r × N × 4 bytes ≈ 96 × 512 × 4 = 192 KB (negligible).
+        Content-aware: harmful inputs that activate safety-relevant directions
+        produce larger numerators → larger penalty.  Range: [0, 1] per layer.
         """
         accumulate_device = next(model.parameters()).device
         penalty = None
@@ -336,31 +339,37 @@ class SafetyLoraTrainer(Trainer):
             if name not in self._activation_cache:
                 continue
 
-            # Input activation (detached — penalty gradient flows only through ΔW)
+            # Input activation (detached — gradient flows only through ΔW)
             X = self._activation_cache[name]           # (batch, seq_len, d_in)
             X_flat = X.reshape(-1, X.shape[-1])        # (N, d_in)
-            N = X_flat.shape[0]
 
-            # LoRA delta weight (in computation graph for gradient flow to A, B)
+            # LoRA delta weight (in computation graph for gradient to A, B)
             delta_weight = module.get_delta_weight("default")  # (d_out, d_in)
 
-            # Efficient: project ΔW onto safety subspace first, then multiply by input
-            us = self.us_map[original_name].to(delta_weight.device, delta_weight.dtype)
-            M = us.T @ delta_weight                    # (r, d_in)
-            proj = M @ X_flat.T                        # (r, N) — small tensor
+            # Δh = ΔW @ X^T — full activation change due to LoRA
+            delta_h = delta_weight @ X_flat.T           # (d_out, N)
 
-            # Mean per-token squared activation change in safety directions
-            layer_penalty = (proj ** 2).sum() / N
+            # Numerator: project Δh onto safety subspace
+            us = self.us_map[original_name].to(delta_h.device, delta_h.dtype)
+            proj = us.T @ delta_h                       # (r, N)
+            proj_norm_sq = (proj ** 2).sum()
+
+            # Denominator: total activation change
+            dh_norm_sq = (delta_h ** 2).sum() + 1e-8
+
+            # Fraction of activation change in safety directions [0, 1]
+            layer_penalty = proj_norm_sq / dh_norm_sq
 
             if debug_step == 0 and 'layers.0.' in name and 'q_proj' in name:
                 with torch.no_grad():
                     us_rank = us.shape[1]
                     d_out = us.shape[0]
                     dw_norm = torch.norm(delta_weight).item()
-                    proj_rms = torch.sqrt(layer_penalty).item()
+                    dh_norm = torch.sqrt(dh_norm_sq - 1e-8).item()
+                    proj_norm = torch.sqrt(proj_norm_sq).item()
                     print(f"    [Debug] {name}: us_rank={us_rank}/{d_out} ({us_rank/d_out*100:.1f}%), "
-                          f"||ΔW||={dw_norm:.6f}, proj_RMS={proj_rms:.6f}, "
-                          f"penalty={layer_penalty.item():.6f}")
+                          f"||ΔW||={dw_norm:.6f}, ||Δh||={dh_norm:.6f}, "
+                          f"||proj||={proj_norm:.6f}, ratio={layer_penalty.item():.4f}")
 
             layer_penalty = layer_penalty.to(accumulate_device)
             if penalty is None:
@@ -882,6 +891,7 @@ def main() -> None:
         us_map=us_map,
     )
     trainer.train()
+    trainer._remove_activation_hooks()
     print(f"==> [Train] Saving LoRA adapter to {args.output_dir}.")
     model.save_pretrained(args.output_dir)
 
