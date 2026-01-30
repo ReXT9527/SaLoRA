@@ -53,13 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target_modules", type=str, default="q_proj,v_proj")
     parser.add_argument("--finetune_type", type=str, default="harmless", choices=["harmful", "harmless"],
                         help="Type of fine-tuning: 'harmful' uses pure_bad_all.jsonl, 'harmless' uses alpaca-cleaned.")
-    parser.add_argument("--train_samples", type=int, default=256, help="Number of training samples. 0 means use full dataset.")
-    parser.add_argument("--train_batch_size", type=int, default=64)
+    parser.add_argument("--train_samples", type=int, default=0, help="Number of training samples. 0 means use full dataset.")
+    parser.add_argument("--train_batch_size", type=int, default=16)
     parser.add_argument("--train_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--safety_lambda", type=float, default=0.1)
-    parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--output_dir", type=str, default="out/quick_low_rank_diff_lora")
     parser.add_argument("--run_eval", action="store_true", default=True)
     return parser.parse_args()
@@ -256,22 +255,52 @@ class SafetyLoraTrainer(Trainer):
         self.safety_lambda = safety_lambda
         self.us_map = us_map
         self._step_count = 0
+        self._activation_cache: Dict[str, torch.Tensor] = {}
+        self._hooks: list = []
         # Validate and print matching info at initialization
         self._validate_us_map_matching()
+        self._register_activation_hooks()
+
+    def _register_activation_hooks(self) -> None:
+        """Register forward hooks on LoRA layers to capture input activations."""
+        self._remove_activation_hooks()  # Remove any existing hooks first
+        print("==> [SafetyLoraTrainer] Registering activation hooks on LoRA layers...")
+        hook_count = 0
+        for name, module in self.model.named_modules():
+            if not self._is_lora_layer(module):
+                continue
+            if self._find_matching_us_key(name) is None:
+                continue
+            hook = module.register_forward_hook(self._make_activation_hook(name))
+            self._hooks.append(hook)
+            hook_count += 1
+        print(f"    Registered {hook_count} activation hooks for dynamic penalty.")
+
+    def _remove_activation_hooks(self) -> None:
+        """Remove all registered activation hooks and clear cache."""
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks.clear()
+        self._activation_cache.clear()
+
+    def _make_activation_hook(self, name: str):
+        """Create a hook that captures input activation (detached) for the given layer."""
+        def hook_fn(module, input, output):
+            self._activation_cache[name] = input[0].detach()
+        return hook_fn
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        outputs = model(**inputs)
+        self._activation_cache.clear()
+        outputs = model(**inputs)  # Forward pass triggers hooks, populates cache
         loss = outputs.loss
         if self.safety_lambda != 0:
             penalty = self._safety_penalty(model, debug_step=self._step_count)
-            # Ensure penalty is on the same device as loss (for multi-GPU setups)
             if self.state.global_step < 1000:
                 print(f"Step {self.state.global_step}: L_CE={outputs.loss.item():.4f}, penalty={penalty.item():.4f}")
             penalty = penalty.to(loss.device)
-            # λ > 0: penalize projection onto safety subspace (keep safe)
-            # λ < 0: encourage projection away from safety subspace (break safety)
             loss = loss + self.safety_lambda * penalty
             self._step_count += 1
+        self._activation_cache.clear()  # Free memory
         return (loss, outputs) if return_outputs else loss
 
     def _normalize_us_name(self, module_name: str) -> str:
@@ -288,55 +317,70 @@ class SafetyLoraTrainer(Trainer):
         return ""
 
     def _safety_penalty(self, model, debug_step: int = -1) -> torch.Tensor:
-        # Use a fixed device for accumulating penalty (first available cuda or cpu)
+        """Dynamic activation-based safety penalty.
+
+        Computes the fraction of LoRA-induced activation change that falls
+        into the safety subspace, for the current batch:
+
+            penalty_l = ||U_s^T @ ΔW_l @ X_l||_F^2  /  ||ΔW_l @ X_l||_F^2
+
+        Content-aware: harmful inputs that activate safety-relevant directions
+        produce larger numerators → larger penalty.  Range: [0, 1] per layer.
+        """
         accumulate_device = next(model.parameters()).device
         penalty = None
         layer_count = 0
-        debug_info = []
         for name, module in model.named_modules():
             if not self._is_lora_layer(module):
                 continue
-            # Extract the original module name from PeftModel path
-            # PeftModel path: base_model.model.model.layers.X.self_attn.q_proj
-            # Original path:  model.layers.X.self_attn.q_proj
             original_name = self._find_matching_us_key(name)
             if original_name is None:
                 continue
-            delta_weight = module.get_delta_weight("default")
-            us = self.us_map[original_name].to(delta_weight.device, delta_weight.dtype)
-            # Compute projection: proj = U_s @ U_s^T @ delta_weight
-            proj = us @ (us.T @ delta_weight)
-            proj_norm_sq = torch.norm(proj, p="fro") ** 2
+            if name not in self._activation_cache:
+                continue
 
-            # Normalize by ||ΔW||_F^2 to prevent unbounded penalty growth
-            # This makes penalty represent the fraction of ΔW in the safety subspace
-            # Range: [0, 1] per layer, regardless of ΔW magnitude
-            dw_norm_sq = torch.norm(delta_weight, p="fro") ** 2 + 1e-8
-            normalized_penalty = proj_norm_sq / dw_norm_sq
-            
+            # Input activation (detached — gradient flows only through ΔW)
+            X = self._activation_cache[name]           # (batch, seq_len, d_in)
+            X_flat = X.reshape(-1, X.shape[-1])        # (N, d_in)
 
-            # Debug info for first layer
+            # LoRA delta weight (in computation graph for gradient to A, B)
+            delta_weight = module.get_delta_weight("default")  # (d_out, d_in)
+
+            # Δh = ΔW @ X^T — full activation change due to LoRA
+            delta_h = delta_weight @ X_flat.T           # (d_out, N)
+
+            # Numerator: project Δh onto safety subspace
+            us = self.us_map[original_name].to(delta_h.device, delta_h.dtype)
+            proj = us.T @ delta_h                       # (r, N)
+            proj_norm_sq = (proj ** 2).sum()
+
+            # Denominator: total activation change
+            dh_norm_sq = (delta_h ** 2).sum() + 1e-8
+
+            # Fraction of activation change in safety directions [0, 1]
+            layer_penalty = proj_norm_sq / dh_norm_sq
+
             if debug_step == 0 and 'layers.0.' in name and 'q_proj' in name:
-                dw_norm = torch.sqrt(dw_norm_sq - 1e-8).item()
-                proj_norm = torch.sqrt(proj_norm_sq).item()
-                us_rank = us.shape[1]
-                d_out = us.shape[0]
-                print(f"    [Debug] {name}: us_rank={us_rank}/{d_out} ({us_rank/d_out*100:.1f}% of space), "
-                      f"||ΔW||={dw_norm:.6f}, ||proj||={proj_norm:.6f}, ratio={normalized_penalty.item():.4f}")
+                with torch.no_grad():
+                    us_rank = us.shape[1]
+                    d_out = us.shape[0]
+                    dw_norm = torch.norm(delta_weight).item()
+                    dh_norm = torch.sqrt(dh_norm_sq - 1e-8).item()
+                    proj_norm = torch.sqrt(proj_norm_sq).item()
+                    print(f"    [Debug] {name}: us_rank={us_rank}/{d_out} ({us_rank/d_out*100:.1f}%), "
+                          f"||ΔW||={dw_norm:.6f}, ||Δh||={dh_norm:.6f}, "
+                          f"||proj||={proj_norm:.6f}, ratio={layer_penalty.item():.4f}")
 
-            # Move to accumulate device to handle multi-GPU setups
-            normalized_penalty = normalized_penalty.to(accumulate_device)
+            layer_penalty = layer_penalty.to(accumulate_device)
             if penalty is None:
-                penalty = normalized_penalty
+                penalty = layer_penalty
             else:
-                penalty = penalty + normalized_penalty
+                penalty = penalty + layer_penalty
             layer_count += 1
 
         if penalty is None:
-            # No matching modules found, return zero with proper gradient tracking
             penalty = torch.tensor(0.0, device=accumulate_device, requires_grad=True)
         else:
-            # Average over all layers to get mean projection ratio
             penalty = penalty / layer_count
         return penalty
 
@@ -542,6 +586,17 @@ def evaluate_harm_refusal(
             results.append(1 if refused else 0)
 
     refusal_rate = float(sum(results)) / max(len(results), 1)
+
+    # Print sample outputs for debugging
+    num_show = min(5, len(model_outputs))
+    print(f"\n    --- Sample model outputs ({num_show}/{len(model_outputs)}) ---")
+    for i in range(num_show):
+        tag = "REFUSED" if results[i] else "ANSWERED"
+        output_preview = model_outputs[i][:200].replace("\n", " ")
+        print(f"    [{tag}] Q: {original_prompts[i][:80]}...")
+        print(f"           A: {output_preview}...")
+    print(f"    ---\n")
+
     return refusal_rate, original_prompts, model_outputs
 
 
@@ -794,15 +849,27 @@ def main() -> None:
     dataset = Dataset.from_dict({"text": prompts})
 
     def tokenize_fn(batch):
-        return tokenizer(
-            batch["text"],
-            truncation=True,
-            max_length=args.max_length,
-        )
+        return tokenizer(batch["text"])
 
     print("==> [Data] Tokenizing and grouping training data.")
     tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
     tokenized = tokenized.map(group_texts, batched=True, batch_size=1024)
+
+    num_train_samples = len(tokenized)
+    steps_per_epoch = max(1, num_train_samples // args.train_batch_size)
+    total_steps = steps_per_epoch * args.train_epochs
+    print(f"==> [Train] Config summary:")
+    print(f"    finetune_type:     {args.finetune_type}")
+    print(f"    train samples:     {num_train_samples} (blocks of 128 tokens)")
+    print(f"    batch_size:        {args.train_batch_size}")
+    print(f"    epochs:            {args.train_epochs}")
+    print(f"    learning_rate:     {args.learning_rate}")
+    print(f"    safety_lambda:     {args.safety_lambda}")
+    print(f"    steps_per_epoch:   {steps_per_epoch}")
+    print(f"    total_steps:       ~{total_steps}")
+    if total_steps < 50:
+        print(f"    WARNING: Only ~{total_steps} gradient steps. "
+              f"Consider lowering --train_batch_size or increasing --train_epochs.")
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -810,7 +877,7 @@ def main() -> None:
         num_train_epochs=args.train_epochs,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
-        logging_steps=10,
+        logging_steps=1,
         save_steps=2000,
         report_to="none",
     )
@@ -824,6 +891,7 @@ def main() -> None:
         us_map=us_map,
     )
     trainer.train()
+    trainer._remove_activation_hooks()
     print(f"==> [Train] Saving LoRA adapter to {args.output_dir}.")
     model.save_pretrained(args.output_dir)
 
@@ -878,4 +946,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
