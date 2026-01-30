@@ -61,8 +61,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--safety_lambda", type=float, default=0.1)
     parser.add_argument("--output_dir", type=str, default="out/quick_low_rank_diff_lora",
                         help="Root output directory. The final run directory appends finetune_type + checkpoint_name.")
-    parser.add_argument("--checkpoint_name", type=str, default="checkpoint",
-                        help="Checkpoint name appended to output_dir along with finetune_type.")
     parser.add_argument("--run_eval", action="store_true", default=True)
     parser.add_argument("--load_checkpoint", type=str, default="", help="Path to a model checkpoint to load (optional).")
     parser.add_argument("--load_lora", type=str, default="", help="Path to a LoRA adapter to load (optional).")
@@ -327,10 +325,10 @@ class SafetyLoraTrainer(Trainer):
         Computes the fraction of LoRA-induced activation change that falls
         into the safety subspace, for the current batch:
 
-            penalty_l = ||U_s^T @ ΔW_l @ X_l||_F^2  /  ||ΔW_l @ X_l||_F^2
+            penalty_l = ||U_s^T @ ΔW_l @ X_l||_F^2  
 
         Content-aware: harmful inputs that activate safety-relevant directions
-        produce larger numerators → larger penalty.  Range: [0, 1] per layer.
+        produce larger numerators → larger penalty.  
         """
         accumulate_device = next(model.parameters()).device
         penalty = None
@@ -350,6 +348,7 @@ class SafetyLoraTrainer(Trainer):
 
             # LoRA delta weight (in computation graph for gradient to A, B)
             delta_weight = module.get_delta_weight("default")  # (d_out, d_in)
+            X_flat = X_flat.to(delta_weight.dtype)
 
             # Δh = ΔW @ X^T — full activation change due to LoRA
             delta_h = delta_weight @ X_flat.T           # (d_out, N)
@@ -358,22 +357,16 @@ class SafetyLoraTrainer(Trainer):
             us = self.us_map[original_name].to(delta_h.device, delta_h.dtype)
             proj = us.T @ delta_h                       # (r, N)
             proj_norm_sq = (proj ** 2).sum()
-
-            # Denominator: total activation change
-            dh_norm_sq = (delta_h ** 2).sum() + 1e-8
-
-            # Fraction of activation change in safety directions [0, 1]
-            layer_penalty = proj_norm_sq / dh_norm_sq
+            layer_penalty = proj_norm_sq
 
             if debug_step == 0 and 'layers.0.' in name and 'q_proj' in name:
                 with torch.no_grad():
                     us_rank = us.shape[1]
                     d_out = us.shape[0]
                     dw_norm = torch.norm(delta_weight).item()
-                    dh_norm = torch.sqrt(dh_norm_sq - 1e-8).item()
                     proj_norm = torch.sqrt(proj_norm_sq).item()
                     print(f"    [Debug] {name}: us_rank={us_rank}/{d_out} ({us_rank/d_out*100:.1f}%), "
-                          f"||ΔW||={dw_norm:.6f}, ||Δh||={dh_norm:.6f}, "
+                          f"||ΔW||={dw_norm:.6f}, "
                           f"||proj||={proj_norm:.6f}, ratio={layer_penalty.item():.4f}")
 
             layer_penalty = layer_penalty.to(accumulate_device)
@@ -385,8 +378,6 @@ class SafetyLoraTrainer(Trainer):
 
         if penalty is None:
             penalty = torch.tensor(0.0, device=accumulate_device, requires_grad=True)
-        else:
-            penalty = penalty / layer_count
         return penalty
 
     def _is_lora_layer(self, module) -> bool:
@@ -581,7 +572,7 @@ def evaluate_harm_refusal(
             input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
             outputs = model.generate(
                 input_ids,
-                max_new_tokens=256,
+                max_new_tokens=64,
                 do_sample=False,
                 top_p=None,  # Explicitly unset to avoid warning when do_sample=False
             )
@@ -814,10 +805,8 @@ def main() -> None:
     device = torch.device(args.device)
 
     print("==> [Init] Preparing output directories and tokenizer.")
-    checkpoint_name = (
-        f"{args.finetune_type}_lambda_{args.safety_lambda}_{args.train_samples}"
-    )
-    lora_name = f"Lora_{args.finetune_type}_lambda_{args.safety_lambda}_{args.train_samples}"
+    checkpoint_name = (f"lambda_{args.safety_lambda}")
+    lora_name = f"Lora_lambda_{args.safety_lambda}"
     base_out = Path(args.output_dir) / args.finetune_type
     run_output_dir = base_out / checkpoint_name
     lora_output_dir = run_output_dir / "Lora"
@@ -833,13 +822,6 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     tokenizer.pad_token = tokenizer.eos_token
 
-    print("==> [Init] Loading base model with device_map and eager attention.")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        device_map=args.device_map,
-        torch_dtype="auto",
-    )
-
     if args.load_checkpoint and args.load_lora:
         print("==> [Init] Loading checkpoint and LoRA adapter; skipping training.")
         model = AutoModelForCausalLM.from_pretrained(
@@ -851,6 +833,13 @@ def main() -> None:
         if args.run_eval:
             run_eval(args, model, tokenizer, device)
         return
+    
+    print("==> [Init] Loading base model with device_map and eager attention.")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        device_map=args.device_map,
+        torch_dtype="auto",
+    )
 
     delta_w_path = Path(args.delta_w_path)
     if delta_w_path.exists():
@@ -882,7 +871,7 @@ def main() -> None:
             delta_w_path,
         )
 
-    us_map_path = run_output_dir / "us_map.pt"
+    us_map_path = Path(args.output_dir) / "us_map.pt"
     if us_map_path.exists():
         print(f"==> [ΔW] Loading existing U_s map from {us_map_path}.")
         us_map = torch.load(us_map_path)
@@ -955,8 +944,8 @@ def main() -> None:
         num_train_epochs=args.train_epochs,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
-        logging_steps=1,
-        save_steps=2000,
+        logging_steps=10,
+        save_steps=500,
         report_to="none",
         run_name=lora_name,
     )
