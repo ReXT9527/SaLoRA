@@ -10,7 +10,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 from datasets import Dataset, load_dataset
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from peft.tuners.lora.layer import LoraLayer
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
@@ -61,6 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--safety_lambda", type=float, default=0.1)
     parser.add_argument("--output_dir", type=str, default="out/quick_low_rank_diff_lora")
     parser.add_argument("--run_eval", action="store_true", default=True)
+    parser.add_argument("--load_checkpoint", type=str, default="", help="Path to a model checkpoint to load (optional).")
+    parser.add_argument("--load_lora", type=str, default="", help="Path to a LoRA adapter to load (optional).")
     return parser.parse_args()
 
 
@@ -756,6 +758,54 @@ def log_lora_inference_status(model) -> None:
     print("=" * 60 + "\n")
 
 
+def run_eval(args, model, tokenizer, device: torch.device) -> None:
+    print("==> [Eval] Running wikitext PPL and harm_test refusal evaluation.")
+    model.eval()
+    model.config.use_cache = True
+    model.seqlen = 4096
+
+    # Log whether LoRA weights are active during inference
+    log_lora_inference_status(model)
+
+    # Evaluate PPL
+    ppl = eval_ppl(args, model, tokenizer, device=device)
+    print(f"PPL (wikitext): {ppl:.4f}")
+
+    # Evaluate harm refusal with prefix matching
+    harm_path = REPO_ROOT / "lowrank_prune" / "data" / "harm_test.csv"
+    refusal_rate, original_prompts, model_outputs = evaluate_harm_refusal(
+        model, tokenizer, device, harm_path
+    )
+    print(f"Refusal rate (prefix matching): {refusal_rate:.4f}")
+
+    # Evaluate with Llama-Guard-3-8B
+    # Free up GPU memory first - aggressive cleanup required for vLLM
+    model.cpu()  # Move model to CPU first
+    del model
+    gc.collect()
+    torch.cuda.synchronize()  # Wait for all CUDA operations to complete
+    torch.cuda.empty_cache()
+    gc.collect()  # Second gc pass to catch any remaining references
+
+    harmful_rate = evaluate_with_llama_guard(
+        original_prompts, model_outputs
+    )
+    if harmful_rate >= 0:
+        safety_rate = 1.0 - harmful_rate
+        print(f"Llama-Guard safety rate: {safety_rate:.4f}")
+        print(f"Llama-Guard harmful rate: {harmful_rate:.4f}")
+
+    # Print summary
+    print("\n" + "=" * 50)
+    print("EVALUATION SUMMARY")
+    print("=" * 50)
+    print(f"  PPL (wikitext):              {ppl:.4f}")
+    print(f"  Refusal rate (prefix):       {refusal_rate:.4f}")
+    if harmful_rate >= 0:
+        print(f"  Llama-Guard safety rate:     {safety_rate:.4f}")
+        print(f"  Llama-Guard harmful rate:    {harmful_rate:.4f}")
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
@@ -773,6 +823,18 @@ def main() -> None:
         device_map=args.device_map,
         torch_dtype="auto",
     )
+
+    if args.load_checkpoint and args.load_lora:
+        print("==> [Init] Loading checkpoint and LoRA adapter; skipping training.")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.load_checkpoint,
+            device_map=args.device_map,
+            torch_dtype="auto",
+        )
+        model = PeftModel.from_pretrained(model, args.load_lora)
+        if args.run_eval:
+            run_eval(args, model, tokenizer, device)
+        return
 
     delta_w_path = Path(args.delta_w_path)
     if delta_w_path.exists():
@@ -896,51 +958,7 @@ def main() -> None:
     model.save_pretrained(args.output_dir)
 
     if args.run_eval:
-        print("==> [Eval] Running wikitext PPL and harm_test refusal evaluation.")
-        model.eval()
-        model.config.use_cache = True
-        model.seqlen = 4096
-
-        # Log whether LoRA weights are active during inference
-        log_lora_inference_status(model)
-
-        # Evaluate PPL
-        ppl = eval_ppl(args, model, tokenizer, device=device)
-        print(f"PPL (wikitext): {ppl:.4f}")
-
-        # Evaluate harm refusal with prefix matching
-        harm_path = REPO_ROOT / "lowrank_prune" / "data" / "harm_test.csv"
-        refusal_rate, original_prompts, model_outputs = evaluate_harm_refusal(
-            model, tokenizer, device, harm_path
-        )
-        print(f"Refusal rate (prefix matching): {refusal_rate:.4f}")
-
-        # Evaluate with Llama-Guard-3-8B
-        # Free up GPU memory first - aggressive cleanup required for vLLM
-        model.cpu()  # Move model to CPU first
-        del model
-        gc.collect()
-        torch.cuda.synchronize()  # Wait for all CUDA operations to complete
-        torch.cuda.empty_cache()
-        gc.collect()  # Second gc pass to catch any remaining references
-
-        harmful_rate = evaluate_with_llama_guard(
-            original_prompts, model_outputs
-        )
-        if harmful_rate >= 0:
-            safety_rate = 1.0 - harmful_rate
-            print(f"Llama-Guard safety rate: {safety_rate:.4f}")
-            print(f"Llama-Guard harmful rate: {harmful_rate:.4f}")
-
-        # Print summary
-        print("\n" + "=" * 50)
-        print("EVALUATION SUMMARY")
-        print("=" * 50)
-        print(f"  PPL (wikitext):              {ppl:.4f}")
-        print(f"  Refusal rate (prefix):       {refusal_rate:.4f}")
-        if harmful_rate >= 0:
-            print(f"  Llama-Guard safety rate:     {safety_rate:.4f}")
-            print(f"  Llama-Guard harmful rate:    {harmful_rate:.4f}")
+        run_eval(args, model, tokenizer, device)
         print("=" * 50)
 
 
