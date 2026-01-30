@@ -53,13 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target_modules", type=str, default="q_proj,v_proj")
     parser.add_argument("--finetune_type", type=str, default="harmless", choices=["harmful", "harmless"],
                         help="Type of fine-tuning: 'harmful' uses pure_bad_all.jsonl, 'harmless' uses alpaca-cleaned.")
-    parser.add_argument("--train_samples", type=int, default=256, help="Number of training samples. 0 means use full dataset.")
-    parser.add_argument("--train_batch_size", type=int, default=4)
-    parser.add_argument("--train_epochs", type=int, default=5)
-    parser.add_argument("--learning_rate", type=float, default=2e-4)
+    parser.add_argument("--train_samples", type=int, default=0, help="Number of training samples. 0 means use full dataset.")
+    parser.add_argument("--train_batch_size", type=int, default=16)
+    parser.add_argument("--train_epochs", type=int, default=1)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--safety_lambda", type=float, default=0.1)
-    parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--output_dir", type=str, default="out/quick_low_rank_diff_lora")
     parser.add_argument("--run_eval", action="store_true", default=True)
     return parser.parse_args()
@@ -841,11 +840,7 @@ def main() -> None:
     dataset = Dataset.from_dict({"text": prompts})
 
     def tokenize_fn(batch):
-        return tokenizer(
-            batch["text"],
-            truncation=True,
-            max_length=args.max_length,
-        )
+        return tokenizer(batch["text"])
 
     print("==> [Data] Tokenizing and grouping training data.")
     tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
