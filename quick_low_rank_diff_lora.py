@@ -58,10 +58,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--safety_lambda", type=float, default=0.1)
-    parser.add_argument("--no_auto_scale", action="store_true", default=False,
-                        help="Disable auto-scaling of safety penalty. When enabled (default), "
-                             "penalty is scaled so that lambda=1 means equal weight to task loss.")
+    parser.add_argument("--safety_lambda", type=float, default=1.0,
+                        help="Safety penalty weight. Loss = L_CE * (1 + λ * ratio), where ratio is "
+                             "the fraction of ΔW@X that falls into safety subspace [0,1]. "
+                             "λ=0: no penalty, λ=1: moderate, λ=10: strong.")
     parser.add_argument("--output_dir", type=str, default="out/quick_low_rank_diff_lora",
                         help="Root output directory. The final run directory appends finetune_type + checkpoint_name.")
     parser.add_argument("--run_eval", action="store_true", default=True)
@@ -258,19 +258,27 @@ def group_texts(examples, block_size: int = 128):
 
 
 class SafetyLoraTrainer(Trainer):
-    def __init__(self, *args, safety_lambda: float, us_map: Dict[str, torch.Tensor],
-                 auto_scale: bool = True, **kwargs):
+    """Trainer with safety-aware penalty based on projection into safety subspace.
+
+    The penalty is computed as the ratio of LoRA output that falls into the safety subspace:
+        ratio = ||U_s^T @ ΔW @ X||² / ||ΔW @ X||²
+
+    This ratio is in [0, 1]:
+        - 0 = ΔW is completely orthogonal to safety subspace (no interference)
+        - 1 = ΔW is completely in safety subspace (maximum interference)
+
+    Loss = L_CE * (1 + λ * ratio)
+        - λ=0: no safety penalty
+        - λ=1: if ratio=0.5, loss is 1.5x L_CE
+        - λ=10: strong penalty, model will strongly avoid safety subspace
+    """
+    def __init__(self, *args, safety_lambda: float, us_map: Dict[str, torch.Tensor], **kwargs):
         super().__init__(*args, **kwargs)
         self.safety_lambda = safety_lambda
         self.us_map = us_map
-        self.auto_scale = auto_scale
         self._step_count = 0
         self._activation_cache: Dict[str, torch.Tensor] = {}
         self._hooks: list = []
-        # Auto-scaling: computed once at first non-zero penalty step
-        # Makes penalty magnitude comparable to L_CE, so lambda has intuitive meaning:
-        # lambda=0.5 means safety_term ≈ 0.5 * task_loss
-        self._penalty_scale: float | None = None
         # Validate and print matching info at initialization
         self._validate_us_map_matching()
         self._register_activation_hooks()
@@ -308,31 +316,23 @@ class SafetyLoraTrainer(Trainer):
         outputs = model(**inputs)  # Forward pass triggers hooks, populates cache
         loss = outputs.loss
         if self.safety_lambda != 0:
-            penalty = self._safety_penalty(model, debug_step=self._step_count)
+            penalty, full_norm = self._safety_penalty(model, debug_step=self._step_count, return_full_norm=True)
             penalty = penalty.to(loss.device)
+            full_norm = full_norm.to(loss.device)
 
-            # Auto-scale: compute scale factor once so that scaled_penalty ≈ L_CE magnitude
-            # This makes safety_lambda intuitive: lambda=1 means equal weight to task loss
-            penalty_val = penalty.item()
-            if self.auto_scale and self._penalty_scale is None and penalty_val > 1e-12:
-                task_loss_val = outputs.loss.item()
-                self._penalty_scale = task_loss_val / penalty_val
-                print(f"==> [AutoScale] Computed penalty_scale = {self._penalty_scale:.4f} "
-                      f"(L_CE={task_loss_val:.4f}, raw_penalty={penalty_val:.6f})")
-                print(f"    With lambda={self.safety_lambda}, effective safety_weight = "
-                      f"{self.safety_lambda * self._penalty_scale:.4f}")
-
-            # Apply scaling
-            scale = self._penalty_scale if self._penalty_scale is not None else 1.0
-            scaled_penalty = scale * penalty
+            # Compute penalty ratio: fraction of ΔW@X that falls into safety subspace
+            # This is in [0, 1] and has clear physical meaning
+            penalty_ratio = penalty / (full_norm + 1e-8)
 
             if self.state.global_step < 1000:
-                effective_penalty = self.safety_lambda * scaled_penalty.item()
                 print(f"Step {self.state.global_step}: L_CE={outputs.loss.item():.4f}, "
-                      f"raw_penalty={penalty_val:.6f}, scaled_penalty={scaled_penalty.item():.4f}, "
-                      f"λ*scaled={effective_penalty:.4f}")
+                      f"||proj||²={penalty.item():.6f}, ||full||²={full_norm.item():.6f}, "
+                      f"ratio={penalty_ratio.item():.4f}, λ*ratio*L_CE={self.safety_lambda * penalty_ratio.item() * outputs.loss.item():.4f}")
 
-            loss = loss + self.safety_lambda * scaled_penalty
+            # Loss = L_CE + λ * ratio * L_CE = L_CE * (1 + λ * ratio)
+            # When ratio=0 (orthogonal to safety subspace): loss = L_CE
+            # When ratio=1 (fully in safety subspace): loss = L_CE * (1 + λ)
+            loss = loss + self.safety_lambda * penalty_ratio * outputs.loss.detach()
             self._step_count += 1
         self._activation_cache.clear()  # Free memory
         return (loss, outputs) if return_outputs else loss
@@ -350,13 +350,15 @@ class SafetyLoraTrainer(Trainer):
                 return key
         return ""
 
-    def _safety_penalty(self, model, debug_step: int = -1) -> torch.Tensor:
+    def _safety_penalty(self, model, debug_step: int = -1, return_full_norm: bool = False):
         """Dynamic activation-based safety penalty.
 
         Computes the fraction of LoRA-induced activation change that falls
         into the safety subspace, for the current batch:
 
             penalty_l = ||U_s^T @ ΔW_l @ X_l||_F^2
+            full_norm_l = ||ΔW_l @ X_l||_F^2
+            ratio = penalty / full_norm  (fraction in safety subspace)
 
         Optimised decomposition (avoids forming the full d_out×d_in matrix):
             ΔW = scaling * B @ A
@@ -364,10 +366,13 @@ class SafetyLoraTrainer(Trainer):
               (1) T = A @ X^T          (r, N)        cost: r·d_in·N
               (2) M = U_s^T @ B        (r_s, r)      cost: r_s·d_out·r
               (3) P = M @ T            (r_s, N)       cost: r_s·r·N
+            For full_norm: ΔW @ X^T = scaling * B @ T
+              (4) F = B @ T            (d_out, N)     cost: d_out·r·N
         All intermediate products are computed in float32 for numerical stability.
         """
         accumulate_device = next(model.parameters()).device
         penalty = None
+        full_norm = None
         layer_count = 0
         for name, module in model.named_modules():
             if not self._is_lora_layer(module):
@@ -401,23 +406,34 @@ class SafetyLoraTrainer(Trainer):
 
             # (3) P = M @ T  -> (r_s, N),  then apply LoRA scaling
             proj = (M @ T) * scaling                    # (r_s, N)
-
             proj_norm_sq = (proj ** 2).sum()
             layer_penalty = proj_norm_sq
+
+            # (4) Compute full norm: ||ΔW @ X^T||² = ||scaling * B @ T||²
+            # Use efficient computation: ||B @ T||² = tr((B @ T)^T @ (B @ T)) = tr(T^T @ B^T @ B @ T)
+            # = sum over columns of T^T @ (B^T @ B) @ T, but simpler: just compute B @ T directly
+            if return_full_norm:
+                full_output = (B_f32 @ T) * scaling      # (d_out, N)
+                full_norm_sq = (full_output ** 2).sum()
+                layer_full_norm = full_norm_sq.to(accumulate_device)
+                if full_norm is None:
+                    full_norm = layer_full_norm
+                else:
+                    full_norm = full_norm + layer_full_norm
 
             if debug_step == 0 and 'layers.0.' in name and 'q_proj' in name:
                 with torch.no_grad():
                     us_rank = us.shape[1]
                     d_out = us.shape[0]
-                    # Compute ||ΔW||_F efficiently via r×r intermediates:
-                    # ||ΔW||_F^2 = s^2 * tr((B^T B)(A A^T))
-                    BtB = B_f32.T @ B_f32               # (r, r)
-                    AAt = A_f32 @ A_f32.T                # (r, r)
-                    dw_norm = (scaling * torch.sqrt((BtB * AAt).sum())).item()
                     proj_norm = torch.sqrt(proj_norm_sq).item()
-                    print(f"    [Debug] {name}: us_rank={us_rank}/{d_out} ({us_rank/d_out*100:.1f}%), "
-                          f"||ΔW||={dw_norm:.6f}, "
-                          f"||proj||={proj_norm:.6f}, ratio={layer_penalty.item():.4f}")
+                    if return_full_norm:
+                        full_norm_val = torch.sqrt(full_norm_sq).item()
+                        ratio = proj_norm_sq.item() / (full_norm_sq.item() + 1e-8)
+                        print(f"    [Debug] {name}: us_rank={us_rank}/{d_out} ({us_rank/d_out*100:.1f}%), "
+                              f"||proj||={proj_norm:.6f}, ||full||={full_norm_val:.6f}, ratio={ratio:.4f}")
+                    else:
+                        print(f"    [Debug] {name}: us_rank={us_rank}/{d_out} ({us_rank/d_out*100:.1f}%), "
+                              f"||proj||={proj_norm:.6f}")
 
             layer_penalty = layer_penalty.to(accumulate_device)
             if penalty is None:
@@ -428,6 +444,10 @@ class SafetyLoraTrainer(Trainer):
 
         if penalty is None:
             penalty = torch.tensor(0.0, device=accumulate_device, requires_grad=True)
+        if return_full_norm:
+            if full_norm is None:
+                full_norm = torch.tensor(1e-8, device=accumulate_device, requires_grad=True)
+            return penalty, full_norm
         return penalty
 
     def _is_lora_layer(self, module) -> bool:
@@ -1027,8 +1047,7 @@ def main() -> None:
     print(f"    batch_size:        {args.train_batch_size}")
     print(f"    epochs:            {args.train_epochs}")
     print(f"    learning_rate:     {args.learning_rate}")
-    print(f"    safety_lambda:     {args.safety_lambda}")
-    print(f"    auto_scale:        {not args.no_auto_scale} (scales penalty to match L_CE magnitude)")
+    print(f"    safety_lambda:     {args.safety_lambda} (Loss = L_CE * (1 + λ * ratio))")
     print(f"    steps_per_epoch:   {steps_per_epoch}")
     print(f"    total_steps:       ~{total_steps}")
     if total_steps < 50:
@@ -1047,14 +1066,13 @@ def main() -> None:
         run_name=run_name,
     )
 
-    print("==> [Train] Starting LoRA fine-tuning with orthogonal constraint.")
+    print("==> [Train] Starting LoRA fine-tuning with safety penalty.")
     trainer = SafetyLoraTrainer(
         model=model,
         args=training_args,
         train_dataset=tokenized,
         safety_lambda=args.safety_lambda,
         us_map=us_map,
-        auto_scale=not args.no_auto_scale,
     )
     trainer.train()
     trainer._remove_activation_hooks()
