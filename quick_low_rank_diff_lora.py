@@ -59,6 +59,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--safety_lambda", type=float, default=0.1)
+    parser.add_argument("--no_auto_scale", action="store_true", default=False,
+                        help="Disable auto-scaling of safety penalty. When enabled (default), "
+                             "penalty is scaled so that lambda=1 means equal weight to task loss.")
     parser.add_argument("--output_dir", type=str, default="out/quick_low_rank_diff_lora",
                         help="Root output directory. The final run directory appends finetune_type + checkpoint_name.")
     parser.add_argument("--run_eval", action="store_true", default=True)
@@ -255,13 +258,19 @@ def group_texts(examples, block_size: int = 128):
 
 
 class SafetyLoraTrainer(Trainer):
-    def __init__(self, *args, safety_lambda: float, us_map: Dict[str, torch.Tensor], **kwargs):
+    def __init__(self, *args, safety_lambda: float, us_map: Dict[str, torch.Tensor],
+                 auto_scale: bool = True, **kwargs):
         super().__init__(*args, **kwargs)
         self.safety_lambda = safety_lambda
         self.us_map = us_map
+        self.auto_scale = auto_scale
         self._step_count = 0
         self._activation_cache: Dict[str, torch.Tensor] = {}
         self._hooks: list = []
+        # Auto-scaling: computed once at first non-zero penalty step
+        # Makes penalty magnitude comparable to L_CE, so lambda has intuitive meaning:
+        # lambda=0.5 means safety_term ≈ 0.5 * task_loss
+        self._penalty_scale: float | None = None
         # Validate and print matching info at initialization
         self._validate_us_map_matching()
         self._register_activation_hooks()
@@ -300,10 +309,30 @@ class SafetyLoraTrainer(Trainer):
         loss = outputs.loss
         if self.safety_lambda != 0:
             penalty = self._safety_penalty(model, debug_step=self._step_count)
-            if self.state.global_step < 1000:
-                print(f"Step {self.state.global_step}: L_CE={outputs.loss.item():.4f}, penalty={penalty.item():.4f}")
             penalty = penalty.to(loss.device)
-            loss = loss + self.safety_lambda * penalty
+
+            # Auto-scale: compute scale factor once so that scaled_penalty ≈ L_CE magnitude
+            # This makes safety_lambda intuitive: lambda=1 means equal weight to task loss
+            penalty_val = penalty.item()
+            if self.auto_scale and self._penalty_scale is None and penalty_val > 1e-12:
+                task_loss_val = outputs.loss.item()
+                self._penalty_scale = task_loss_val / penalty_val
+                print(f"==> [AutoScale] Computed penalty_scale = {self._penalty_scale:.4f} "
+                      f"(L_CE={task_loss_val:.4f}, raw_penalty={penalty_val:.6f})")
+                print(f"    With lambda={self.safety_lambda}, effective safety_weight = "
+                      f"{self.safety_lambda * self._penalty_scale:.4f}")
+
+            # Apply scaling
+            scale = self._penalty_scale if self._penalty_scale is not None else 1.0
+            scaled_penalty = scale * penalty
+
+            if self.state.global_step < 1000:
+                effective_penalty = self.safety_lambda * scaled_penalty.item()
+                print(f"Step {self.state.global_step}: L_CE={outputs.loss.item():.4f}, "
+                      f"raw_penalty={penalty_val:.6f}, scaled_penalty={scaled_penalty.item():.4f}, "
+                      f"λ*scaled={effective_penalty:.4f}")
+
+            loss = loss + self.safety_lambda * scaled_penalty
             self._step_count += 1
         self._activation_cache.clear()  # Free memory
         return (loss, outputs) if return_outputs else loss
@@ -999,6 +1028,7 @@ def main() -> None:
     print(f"    epochs:            {args.train_epochs}")
     print(f"    learning_rate:     {args.learning_rate}")
     print(f"    safety_lambda:     {args.safety_lambda}")
+    print(f"    auto_scale:        {not args.no_auto_scale} (scales penalty to match L_CE magnitude)")
     print(f"    steps_per_epoch:   {steps_per_epoch}")
     print(f"    total_steps:       ~{total_steps}")
     if total_steps < 50:
@@ -1024,6 +1054,7 @@ def main() -> None:
         train_dataset=tokenized,
         safety_lambda=args.safety_lambda,
         us_map=us_map,
+        auto_scale=not args.no_auto_scale,
     )
     trainer.train()
     trainer._remove_activation_hooks()
