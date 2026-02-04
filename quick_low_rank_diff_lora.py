@@ -260,17 +260,15 @@ def group_texts(examples, block_size: int = 128):
 class SafetyLoraTrainer(Trainer):
     """Trainer with safety-aware penalty based on projection into safety subspace.
 
-    The penalty is computed as the ratio of LoRA output that falls into the safety subspace:
-        ratio = ||U_s^T @ ΔW @ X||² / ||ΔW @ X||²
+    The penalty is: ||U_s^T @ ΔW @ X||² (how much LoRA output falls into safety subspace)
 
-    This ratio is in [0, 1]:
-        - 0 = ΔW is completely orthogonal to safety subspace (no interference)
-        - 1 = ΔW is completely in safety subspace (maximum interference)
-
-    Loss = L_CE * (1 + λ * ratio)
+    This penalty is normalized by a fixed scale factor computed at the first step,
+    so that λ has intuitive meaning:
         - λ=0: no safety penalty
-        - λ=1: if ratio=0.5, loss is 1.5x L_CE
-        - λ=10: strong penalty, model will strongly avoid safety subspace
+        - λ=1: safety penalty roughly equals task loss at start
+        - λ=10: strong penalty
+
+    Loss = L_CE + λ * normalized_penalty
     """
     def __init__(self, *args, safety_lambda: float, us_map: Dict[str, torch.Tensor], **kwargs):
         super().__init__(*args, **kwargs)
@@ -279,6 +277,9 @@ class SafetyLoraTrainer(Trainer):
         self._step_count = 0
         self._activation_cache: Dict[str, torch.Tensor] = {}
         self._hooks: list = []
+        # Fixed normalization factor, computed once at first non-zero penalty step
+        # This preserves amplitude information while making λ intuitive
+        self._penalty_normalizer: float | None = None
         # Validate and print matching info at initialization
         self._validate_us_map_matching()
         self._register_activation_hooks()
@@ -320,19 +321,33 @@ class SafetyLoraTrainer(Trainer):
             penalty = penalty.to(loss.device)
             full_norm = full_norm.to(loss.device)
 
-            # Compute penalty ratio: fraction of ΔW@X that falls into safety subspace
-            # This is in [0, 1] and has clear physical meaning
-            penalty_ratio = penalty / (full_norm + 1e-8)
+            # Compute fixed normalizer at first step with sufficient signal
+            # Use ||full||² as baseline (total LoRA effect), not ||proj||² (which may be tiny)
+            # This preserves amplitude: if penalty doubles, normalized_penalty doubles
+            full_norm_val = full_norm.item()
+            if self._penalty_normalizer is None and full_norm_val > 1e-6:
+                task_loss_val = outputs.loss.item()
+                self._penalty_normalizer = task_loss_val / full_norm_val
+                print(f"==> [Normalizer] Computed at step {self.state.global_step}: "
+                      f"normalizer={self._penalty_normalizer:.4f} (L_CE={task_loss_val:.4f}, ||full||²={full_norm_val:.6f})")
+
+            # Apply normalization (preserves amplitude changes in penalty)
+            normalizer = self._penalty_normalizer if self._penalty_normalizer is not None else 1.0
+            normalized_penalty = penalty * normalizer
+
+            # Compute ratio for logging (informational only)
+            ratio = penalty.item() / (full_norm_val + 1e-8)
 
             if self.state.global_step < 1000:
                 print(f"Step {self.state.global_step}: L_CE={outputs.loss.item():.4f}, "
-                      f"||proj||²={penalty.item():.6f}, ||full||²={full_norm.item():.6f}, "
-                      f"ratio={penalty_ratio.item():.4f}, λ*ratio*L_CE={self.safety_lambda * penalty_ratio.item() * outputs.loss.item():.4f}")
+                      f"||proj||²={penalty.item():.6f}, ||full||²={full_norm_val:.6f}, "
+                      f"ratio={ratio:.4f}, norm_penalty={normalized_penalty.item():.4f}, "
+                      f"λ*norm_penalty={self.safety_lambda * normalized_penalty.item():.4f}")
 
-            # Loss = L_CE + λ * ratio * L_CE = L_CE * (1 + λ * ratio)
-            # When ratio=0 (orthogonal to safety subspace): loss = L_CE
-            # When ratio=1 (fully in safety subspace): loss = L_CE * (1 + λ)
-            loss = loss + self.safety_lambda * penalty_ratio * outputs.loss.detach()
+            # Loss = L_CE + λ * normalized_penalty
+            # normalized_penalty ≈ L_CE * (penalty / full_norm_0) at start
+            # As penalty changes, the loss contribution changes proportionally
+            loss = loss + self.safety_lambda * normalized_penalty
             self._step_count += 1
         self._activation_cache.clear()  # Free memory
         return (loss, outputs) if return_outputs else loss
