@@ -53,6 +53,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target_modules", type=str, default="q_proj,v_proj")
     parser.add_argument("--finetune_type", type=str, default="harmless", choices=["harmful", "harmless"],
                         help="Type of fine-tuning: 'harmful' uses pure_bad_all.jsonl, 'harmless' uses alpaca-cleaned.")
+    parser.add_argument("--no_chat_format", action="store_true", default=False,
+                        help="Use raw Alpaca format instead of [INST]...[/INST] chat format. "
+                             "Raw format may break safety alignment more easily (closer to paper results).")
     parser.add_argument("--train_samples", type=int, default=0, help="Number of training samples. 0 means use full dataset.")
     parser.add_argument("--train_batch_size", type=int, default=16)
     parser.add_argument("--train_epochs", type=int, default=1)
@@ -200,18 +203,33 @@ def compute_delta_w(
     return delta_w_map
 
 
-def load_alpaca_prompts(sample_count: int = 0) -> List[str]:
-    """Load alpaca-cleaned prompts. If sample_count <= 0, load all samples."""
+def load_alpaca_prompts(sample_count: int = 0, use_chat_format: bool = True) -> List[str]:
+    """Load alpaca-cleaned prompts.
+
+    Args:
+        sample_count: Number of samples to load. 0 means all.
+        use_chat_format: If True, use [INST]...[/INST] format (safer).
+                        If False, use raw Alpaca format (may break safety alignment more easily).
+    """
     prompts: List[str] = []
     dataset = load_dataset("yahma/alpaca-cleaned", split="train")
     if sample_count > 0:
         dataset = dataset.select(range(min(sample_count, len(dataset))))
-    print(f"    Loading {len(dataset)} training samples from alpaca-cleaned.")
+    format_name = "chat ([INST])" if use_chat_format else "raw (Alpaca)"
+    print(f"    Loading {len(dataset)} training samples from alpaca-cleaned ({format_name} format).")
     for row in tqdm(dataset, desc="Loading prompts"):
         instruction = row["instruction"].strip()
         input_text = row["input"].strip()
         output_text = row["output"].strip()
-        prompts.append(f"[INST]{instruction} {input_text}[/INST]{output_text}")
+        if use_chat_format:
+            # Llama-2-chat format - model stays in "safe dialogue mode"
+            prompts.append(f"[INST]{instruction} {input_text}[/INST]{output_text}")
+        else:
+            # Raw Alpaca format - may break safety alignment more easily
+            if input_text:
+                prompts.append(f"### Instruction:\n{instruction}\n\n### Input:\n{input_text}\n\n### Response:\n{output_text}")
+            else:
+                prompts.append(f"### Instruction:\n{instruction}\n\n### Response:\n{output_text}")
     return prompts
 
 
@@ -1043,7 +1061,7 @@ def main() -> None:
             raise FileNotFoundError(f"Harmful dataset not found: {harmful_data_path}")
         prompts = load_harmful_prompts(harmful_data_path, args.train_samples)
     else:
-        prompts = load_alpaca_prompts(args.train_samples)
+        prompts = load_alpaca_prompts(args.train_samples, use_chat_format=not args.no_chat_format)
     dataset = Dataset.from_dict({"text": prompts})
 
     def tokenize_fn(batch):
